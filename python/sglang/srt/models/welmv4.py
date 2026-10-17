@@ -201,6 +201,140 @@ class KVMirrorManager:
         return kv_activation
 
 
+class WelmSpecNgramRing:
+    """Per-request ring of recent token ids for speculative decoding.
+
+    Over-encoding needs the 1/2/3 tokens preceding every input token. Outside
+    plain prefill (target verify, draft decode, draft extend) the scheduler
+    cannot provide them, because they include draft tokens that only exist on
+    the device. Each request keeps its last ``SLOTS`` tokens, indexed by
+    ``target_position % SLOTS``; a forward first writes its own tokens and
+    then reads the predecessors, so chains inside one forward resolve to the
+    drafted tokens and everything before the segment resolves to committed
+    tokens. Draft-model inputs are shifted by one (the draft at position p
+    consumes token p + 1), so they use ``target_position = position + 1``.
+
+    Request pool slot 0 is reserved for padding, so padded graph rows only
+    ever touch row 0.
+    """
+
+    SLOTS = 8
+    ROWS = 1 << 16
+    buf: Optional[torch.Tensor] = None
+
+    @classmethod
+    def ensure(cls, device) -> torch.Tensor:
+        if cls.buf is None:
+            cls.buf = torch.zeros((cls.ROWS, cls.SLOTS), dtype=torch.int64, device=device)
+        return cls.buf
+
+
+def _welm_read_ring(ring, rows, tpos):
+    grams = []
+    for back in (1, 2, 3):
+        p = tpos - back
+        val = ring[rows, torch.remainder(p, ring.shape[1])]
+        grams.append(torch.where(p >= 0, val, torch.zeros_like(val)))
+    return grams
+
+
+def welm_spec_n_gram_input_ids(input_ids, positions, forward_batch, is_draft: bool):
+    """Return the NGramInputIds to use for this forward (see WelmSpecNgramRing)."""
+    from sglang.srt.managers.schedule_batch import NGramInputIds
+
+    current = forward_batch.n_gram_input_ids
+    if get_global_server_args().speculative_algorithm is None:
+        return current
+    mode = forward_batch.forward_mode
+    num_tokens = input_ids.shape[0]
+    if num_tokens == 0 or mode.is_idle():
+        return current
+    ring = WelmSpecNgramRing.ensure(input_ids.device)
+    slots = ring.shape[1]
+    ids = input_ids.to(torch.int64)
+    tpos = positions.to(torch.int64) + (1 if is_draft else 0)
+
+    if mode.is_extend_without_speculative():
+        # Prefill: per-token request rows and in-segment offsets.
+        seg_lens = forward_batch.extend_seq_lens
+        bs = seg_lens.shape[0]
+        rows = torch.repeat_interleave(
+            forward_batch.req_pool_indices.to(torch.int64), seg_lens, output_size=num_tokens
+        )
+        seg_start = torch.cumsum(seg_lens, 0) - seg_lens
+        idx = torch.arange(num_tokens, device=ids.device) - torch.repeat_interleave(
+            seg_start, seg_lens, output_size=num_tokens
+        )
+        lens = torch.repeat_interleave(seg_lens, seg_lens, output_size=num_tokens)
+        # Keep only the tail of each segment so no ring slot is written twice.
+        tail = idx >= lens - slots
+        ring[rows[tail], torch.remainder(tpos[tail], slots)] = ids[tail]
+        if not is_draft:
+            # Target prefill uses the exact scheduler grams; also record the
+            # predecessors of short segments (prefix-cache hits, chunking).
+            first = idx == 0
+            for back, gram in zip((1, 2, 3), current.input_ids_grams):
+                p = tpos - back
+                sel = first & (p >= 0) & (lens + back <= slots)
+                ring[rows[sel], torch.remainder(p[sel], slots)] = gram[sel].to(
+                    torch.int64
+                )
+            return current
+        # Draft prefill: input j is target token j + 1 of the segment, so its
+        # grams are the target grams of token j + 1; the last token (the newly
+        # sampled one) reads its predecessors from the ring.
+        last = idx == lens - 1
+        nxt = torch.clamp(torch.arange(num_tokens, device=ids.device) + 1, max=num_tokens - 1)
+        ring_grams = _welm_read_ring(ring, rows, tpos)
+        grams = [
+            torch.where(last, rg, g.to(torch.int64)[nxt])
+            for rg, g in zip(ring_grams, current.input_ids_grams)
+        ]
+        return NGramInputIds(input_ids_grams=grams)
+
+    # Verify / draft decode / draft extend: uniform tokens per request.
+    bs = forward_batch.req_pool_indices.shape[0]
+    per_req = num_tokens // bs
+    rows = torch.repeat_interleave(forward_batch.req_pool_indices.to(torch.int64), per_req)
+    ring[rows, torch.remainder(tpos, slots)] = ids
+    out = NGramInputIds(input_ids_grams=_welm_read_ring(ring, rows, tpos))
+    return out
+
+
+def welm_mtp_mirror_kv(input_ids, positions, forward_batch, embed_tokens, oe_fn):
+    """Set the NextN layer's KV-mirror activation for a non-prefill draft forward.
+
+    In draft prefill the NextN layer (a KV-mirror layer imitating layer 0)
+    projects target layer 0's attention input of token p with its own K/V
+    weights. Reproduce that for draft decode / draft extend: token p is the
+    predecessor of the draft input, and layer 0's input is
+    input_layernorm(OE-embedding(token p)).
+    """
+    from sglang.srt.managers.schedule_batch import NGramInputIds
+
+    ring = WelmSpecNgramRing.ensure(input_ids.device)
+    bs = forward_batch.req_pool_indices.shape[0]
+    rows = torch.repeat_interleave(
+        forward_batch.req_pool_indices.to(torch.int64), input_ids.shape[0] // bs
+    )
+    tpos = positions.to(torch.int64)
+    tok = ring[rows, torch.remainder(tpos, ring.shape[1])]
+    grams = NGramInputIds(input_ids_grams=_welm_read_ring(ring, rows, tpos))
+    h = oe_fn(tok, grams, embed_tokens(tok))
+    layer0 = LayerManager.decoder_layer[0]
+    h0 = layer0.input_layernorm(h)
+    if isinstance(h0, tuple):
+        h0 = h0[0]
+    attn0 = layer0.self_attn
+    qkv = F.linear(h0, attn0.qkv_proj_weight, attn0.qkv_proj_bias)
+    _, _, _, mirror_k, mirror_v = qkv.split(
+        [attn0.q_size, attn0.kv_size, attn0.kv_size, attn0.kv_size, attn0.kv_size],
+        dim=-1,
+    )
+    KVMirrorManager.set_kv_activation(0, (mirror_k, mirror_v))
+    forward_batch.welm_mtp_mirror_kv = True
+
+
 class LayerManager:
     decoder_layer = dict()
     num_nextn_predict_layers: int = 0
@@ -914,8 +1048,11 @@ class Qwen2MoeAttention(nn.Module):
             self.kv_mirror_imitated_layers,
             flush=True,
         )
-        if len(sliding_window_size_layerwise) > layer_idx:
-            window = sliding_window_size_layerwise[layer_idx]
+        # Layer-wise config lists are indexed by the global layer id; the NextN
+        # (MTP) layer is local layer 0 but sits after the target layers.
+        cfg_layer_idx = layer_idx + total_layer_num if is_nextn else layer_idx
+        if len(sliding_window_size_layerwise) > cfg_layer_idx:
+            window = sliding_window_size_layerwise[cfg_layer_idx]
             # Match the HF reference: a window equal to max_position_embeddings
             # means full attention, and a window of N keeps the query plus the
             # previous N - 1 keys (FlashAttention's inclusive left bound).
@@ -932,8 +1069,8 @@ class Qwen2MoeAttention(nn.Module):
             self.sliding_window_size,
             flush=True,
         )
-        if len(enable_attn_sink_layerwise) > layer_idx:
-            self.enable_attention_sink = enable_attn_sink_layerwise[layer_idx]
+        if len(enable_attn_sink_layerwise) > cfg_layer_idx:
+            self.enable_attention_sink = enable_attn_sink_layerwise[cfg_layer_idx]
         else:
             self.enable_attention_sink = False
         print(
@@ -1022,10 +1159,12 @@ class Qwen2MoeAttention(nn.Module):
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
-        self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
         self.kv_mirror_layer_idx = (
             layer_idx if not is_nextn else layer_idx + len(LayerManager.decoder_layer)
         )
+        # Use the global index: the NextN layer is local layer 0 but mirrors
+        # as layer num_hidden_layers.
+        self.attn.is_kv_mirror = self.kv_mirror_layer_idx in self.kv_mirror_layers
         if get_global_server_args().speculative_algorithm is not None:
             self.need_clear_kv_cache = (
                 self.layer_idx == LayerManager.num_nextn_predict_layers - 1
@@ -1068,6 +1207,7 @@ class Qwen2MoeAttention(nn.Module):
             if (
                 self.kv_mirror_layer_idx in LayerManager.num_nextn_predict_layer_idx
                 and not forward_batch.forward_mode.is_extend_without_speculative()
+                and not getattr(forward_batch, "welm_mtp_mirror_kv", False)
             ):
                 qkv, _ = self.qkv_proj(hidden_states)
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1752,6 +1892,10 @@ class Qwen2MoeModel(nn.Module):
             if _welm_dump_enabled():
                 _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
+            if len(self.oe_grams) > 0:
+                forward_batch.n_gram_input_ids = welm_spec_n_gram_input_ids(
+                    input_ids, positions, forward_batch, is_draft=False
+                )
             if len(self.oe_grams) > 0 and forward_batch.n_gram_input_ids is not None:
                 hidden_states = self._compute_oe_embedding(
                     input_ids, forward_batch, hidden_states
@@ -1971,6 +2115,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
 
+            if len(self.model.oe_grams) > 0:
+                forward_batch.n_gram_input_ids = welm_spec_n_gram_input_ids(
+                    input_ids, positions, forward_batch, is_draft=False
+                )
             if (
                 len(self.model.oe_grams) > 0
                 and forward_batch.n_gram_input_ids is not None
@@ -2223,6 +2371,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def post_init_after_load_weights(self, is_nextn=False):
+        if get_global_server_args().speculative_algorithm is not None:
+            # Allocate eagerly so CUDA graph capture never creates it.
+            param = next(self.parameters(), None)
+            if param is not None and param.device.type != "meta":
+                WelmSpecNgramRing.ensure(param.device)
         total_kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])
         total_kv_mirror_imitated_layers = getattr(
             self.model.config, "kv_mirror_imitated_layers", []

@@ -830,6 +830,9 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM":
+            self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+
         if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
