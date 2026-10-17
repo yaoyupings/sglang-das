@@ -344,6 +344,8 @@ def vllm_flash_attn_with_kvcache(
             layout=layout,
         )
 
+    if _is_hcu:
+        q, softmax_scale = _hcu_prescale_q_for_paged_attention(q, softmax_scale)
     return vllm_flash_attn_with_kvcache_interface(
         q=q,
         k_cache=k_cache,
@@ -359,6 +361,22 @@ def vllm_flash_attn_with_kvcache(
         s_aux=sinks,
         num_splits=num_splits,
     )
+
+
+def _hcu_prescale_q_for_paged_attention(q, softmax_scale):
+    """Fold a non-default softmax scale into q for the HCU paged-attention kernel.
+
+    The vendor ``flash_attn_cuda.paged_attention`` kernel (used by
+    ``vllm_flash_attn_with_kvcache`` and by the varlen interface whenever
+    ``max_seqlen_q < 16``) ignores ``softmax_scale`` and always uses
+    1/sqrt(head_dim). Scaling q instead gives identical scores (and LSE).
+    """
+    if softmax_scale is None or q.dtype not in (torch.float16, torch.bfloat16):
+        return q, softmax_scale
+    default = q.shape[-1] ** -0.5
+    if abs(softmax_scale - default) <= 1e-6 * default:
+        return q, softmax_scale
+    return (q.float() * (softmax_scale / default)).to(q.dtype), default
 
 
 def _apply_flash_attn_varlen_out(result, out, return_softmax_lse):
@@ -759,6 +777,10 @@ def vllm_flash_attn_varlen_func(
     # paged-prefill kernel, which applies sinks correctly.
     if _is_hcu and sinks is not None and 1 < max_seqlen_q < 16:
         max_seqlen_q = 16
+    # Below 16 query tokens the vendor varlen interface dispatches to the
+    # paged-attention kernel, which ignores softmax_scale.
+    if _is_hcu and max_seqlen_q < 16:
+        q, softmax_scale = _hcu_prescale_q_for_paged_attention(q, softmax_scale)
 
     # The HCU sliding-window paged-prefill kernel silently ignores s_aux.
     # Apply the sinks exactly from the softmax LSE instead: a softmax over

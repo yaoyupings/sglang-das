@@ -1584,7 +1584,13 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     seqused_k=cache_seqlens,
-                    max_seqlen_k=metadata.max_seq_len_k,
+                    # CUDA-graph target-verify metadata leaves max_seq_len_k
+                    # unset (0); the HCU kernel sizes its paged->contiguous KV
+                    # copy from it, so fall back to the page-table bound.
+                    max_seqlen_k=(
+                        metadata.max_seq_len_k
+                        or page_table.shape[1] * self.page_size
+                    ),
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
@@ -2235,6 +2241,9 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
+                        # Cascade merging would apply sinks twice; sinks are
+                        # only supported on the single-pass (topk=1) path.
+                        sinks=None if use_cascade_attn else kwargs.get("sinks"),
                     )
                     result = _restore_padded_q_rows(result, _sp_padded_rows)
                 elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:
