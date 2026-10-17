@@ -769,9 +769,15 @@ def build_decode_registry(
         if n_gram is not None:
 
             def _n_gram_source(order):
-                def _fn(fb, _ctx):
+                def _fn(fb, ctx):
                     ids = getattr(fb, "n_gram_input_ids", None)
-                    return None if ids is None else ids.get_gram(order)
+                    gram = None if ids is None else ids.get_gram(order)
+                    # Under speculative decoding the model rebuilds n-grams
+                    # itself and the scheduler's ids may be stale (another
+                    # token count); copy only exact-length sources.
+                    if gram is None or gram.shape[0] != ctx.raw_num_tokens:
+                        return None
+                    return gram
 
                 return _fn
 

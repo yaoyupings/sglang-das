@@ -1300,9 +1300,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 and forward_batch.n_gram_input_ids is not None
             ):
                 for n in (2, 3, 4):
-                    self.buffers.n_gram_input_ids[str(n)][: self.raw_num_token].copy_(
-                        forward_batch.n_gram_input_ids.get_gram(n)
-                    )
+                    gram = forward_batch.n_gram_input_ids.get_gram(n)
+                    # Under speculative decoding the model rebuilds n-grams
+                    # from its own ring buffer and the scheduler's ids can be
+                    # stale (different token count); only copy exact matches.
+                    if gram is not None and gram.shape[0] == self.raw_num_token:
+                        self.buffers.n_gram_input_ids[str(n)][
+                            : self.raw_num_token
+                        ].copy_(gram)
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
