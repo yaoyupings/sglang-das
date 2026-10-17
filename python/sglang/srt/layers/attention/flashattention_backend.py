@@ -118,6 +118,10 @@ class FlashAttentionMetadata:
     max_seq_len_k: int = 0
     # Cumulative sequence lengths for query
     cu_seqlens_q: torch.Tensor = None
+    # Query metadata for WeLM KV-mirror layers. Mirror queries contain one
+    # token per request even when the surrounding extend batch is multi-token.
+    mirror_cu_seqlens_q: torch.Tensor = None
+    mirror_max_seq_len_q: int = 1
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor = None
     # Dummy-tail varlen metadata for the fa_skip_kv_cache path under a piecewise
@@ -1059,6 +1063,12 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
+            if forward_batch.enable_kv_mirror:
+                metadata.mirror_cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+                metadata.mirror_max_seq_len_q = 1
+
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
@@ -1407,6 +1417,18 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+        elif (
+            getattr(layer, "is_kv_mirror", False)
+            and forward_batch.custom_last_index is not None
+            and metadata.mirror_cu_seqlens_q is not None
+        ):
+            # WeLM mirror layers reduce the query to one row per request while
+            # continuing to read the ordinary per-request KV cache.
+            page_table = metadata.page_table
+            cu_seqlens_q = metadata.mirror_cu_seqlens_q
+            cache_seqlens = metadata.cache_seqlens_int32
+            max_seqlen_q = metadata.mirror_max_seq_len_q
+            cu_seqlens_k = metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
@@ -1587,6 +1609,7 @@ class FlashAttentionBackend(AttentionBackend):
                         else None
                     ),
                     layout="legacy_bhsd",
+                    sinks=kwargs.get("sinks"),
                     out=_fa_out,
                     total_k_hint=(
                         forward_batch.seq_lens_sum
@@ -1626,6 +1649,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
+                    sinks=kwargs.get("sinks"),
                 )
                 result = _restore_padded_q_rows(result, _sp_padded_rows)
             elif not self._use_hcu_legacy_layout and _use_varlen_fwd_unified_fa:

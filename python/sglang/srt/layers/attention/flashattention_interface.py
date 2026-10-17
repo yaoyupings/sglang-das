@@ -356,6 +356,7 @@ def vllm_flash_attn_with_kvcache(
         window_size=window_size,
         softcap=softcap,
         return_softmax_lse=return_softmax_lse,
+        s_aux=sinks,
         num_splits=num_splits,
     )
 
@@ -477,6 +478,7 @@ def vllm_flash_attn_varlen_func(
     layout=None,
     out=None,
     total_k_hint: Optional[int] = None,
+    sinks=None,
 ):
     # Prefill already has an exact host KV-length sum. The vendor paged
     # prefill wrapper recomputes seqused_k.sum() and branches on that device
@@ -750,6 +752,46 @@ def vllm_flash_attn_varlen_func(
             return out
         return result
 
+    # The HCU paged "MTP" branch (selected for uniform 1 < max_seqlen_q < 16
+    # batches) folds query tokens into heads and rejects or ignores
+    # per-head attention sinks. ``max_seqlen_q`` is only an upper bound for
+    # the varlen kernel, so raising it routes these batches to the regular
+    # paged-prefill kernel, which applies sinks correctly.
+    if _is_hcu and sinks is not None and 1 < max_seqlen_q < 16:
+        max_seqlen_q = 16
+
+    # The HCU sliding-window paged-prefill kernel silently ignores s_aux.
+    # Apply the sinks exactly from the softmax LSE instead: a softmax over
+    # [scores, sink] equals the sink-free output scaled by sigmoid(lse - sink).
+    if (
+        _is_hcu
+        and sinks is not None
+        and max_seqlen_q > 1
+        and window_size is not None
+        and window_size[0] >= 0
+    ):
+        result, lse = vllm_flash_attn_varlen_func_interface(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_table,
+            fa_version=fa_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            return_softmax_lse=True,
+        )[:2]
+        # lse: [num_heads, total_q] -> [total_q, num_heads, 1]
+        scale = torch.sigmoid(lse.t().float() - sinks.float()[None, :])
+        return (result.float() * scale.unsqueeze(-1)).to(result.dtype)
+
     # Capture may leave the host bound at zero; live lengths remain on GPU.
     return vllm_flash_attn_varlen_func_interface(
         q=q,
@@ -767,4 +809,5 @@ def vllm_flash_attn_varlen_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        s_aux=sinks,
     )

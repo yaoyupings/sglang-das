@@ -477,6 +477,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
+    # For WeLM over-encoding and KV mirror.
+    n_gram_input_ids: Optional["NGramInputIds"] = None
+    enable_kv_mirror: bool = False
+    custom_last_index: Optional[torch.Tensor] = None
+    scale_seq_factor: int = 1
+
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -922,7 +928,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
-            # Host-side metadata
+            n_gram_input_ids=batch.n_gram_input_ids,
+            scale_seq_factor=1,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
@@ -936,6 +943,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         ret._maybe_init_non_generation_fields(batch)
+        ret.enable_kv_mirror = model_runner.server_args.enable_kv_mirror
 
         device = model_runner.device
         pin_host_metadata = _pin_host_metadata(device)

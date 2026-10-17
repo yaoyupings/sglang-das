@@ -194,6 +194,10 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # WeLM KV-mirror extend batches already contain one hidden state per request.
+    enable_kv_mirror: bool = False
+    scale_seq_factor: int = 1
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
@@ -259,6 +263,8 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            enable_kv_mirror=forward_batch.enable_kv_mirror,
+            scale_seq_factor=forward_batch.scale_seq_factor,
             draft_extend_select_index=draft_extend_select_index,
             spec_input_type=getattr(forward_batch.spec_info, "spec_input_type", None),
         )
@@ -414,7 +420,13 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
-        if not logits_metadata.extend_return_logprob:
+        # KV-mirror extend batches already contain one hidden state per request;
+        # there are no intermediate-token logits to process as input logprobs.
+        kv_mirror_extend = logits_metadata.enable_kv_mirror and (
+            logits_metadata.forward_mode.is_extend_without_speculative()
+            or logits_metadata.scale_seq_factor > 1
+        )
+        if not logits_metadata.extend_return_logprob or kv_mirror_extend:
             if (
                 self.draft_lm_head_vp is not None
                 and logits_metadata.forward_mode.is_decode_or_idle()
@@ -593,6 +605,13 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or (
+                logits_metadata.enable_kv_mirror
+                and (
+                    logits_metadata.forward_mode.is_extend_without_speculative()
+                    or logits_metadata.scale_seq_factor > 1
+                )
+            )
         ):
             if logits_metadata.draft_extend_select_index is not None:
                 # Only next_token_logits narrows to [bs, vocab]; the
