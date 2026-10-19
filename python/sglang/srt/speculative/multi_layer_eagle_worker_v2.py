@@ -186,6 +186,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.chain_mtp_hidden_states = draft_arch in [
             "Step3p5MTP",
             "InklingForConditionalGenerationMTP",
+            "WeLMV4MoeForCausalLMNextN",
+            "WeLMV4VLMForConditionalGeneration",
         ]
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context

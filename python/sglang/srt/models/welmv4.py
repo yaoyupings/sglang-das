@@ -458,8 +458,14 @@ def welm_use_device_ngram() -> bool:
     )
 
 
-def welm_spec_n_gram_input_ids(input_ids, positions, forward_batch, is_draft: bool):
-    """Return the NGramInputIds to use for this forward (see WelmSpecNgramRing)."""
+def welm_spec_n_gram_input_ids(
+    input_ids, positions, forward_batch, is_draft: bool, draft_shift: int = 1
+):
+    """Return the NGramInputIds to use for this forward (see WelmSpecNgramRing).
+
+    ``draft_shift`` is how many tokens a draft input runs ahead of its position:
+    1 for a single NextN layer, ``1 + k`` for multi-layer EAGLE step ``k``.
+    """
     from sglang.srt.managers.schedule_batch import NGramInputIds
 
     current = forward_batch.n_gram_input_ids
@@ -472,7 +478,8 @@ def welm_spec_n_gram_input_ids(input_ids, positions, forward_batch, is_draft: bo
     ring = WelmSpecNgramRing.ensure(input_ids.device)
     slots = ring.shape[1]
     ids = input_ids.to(torch.int64)
-    tpos = positions.to(torch.int64) + (1 if is_draft else 0)
+    shift = draft_shift if is_draft else 0
+    tpos = positions.to(torch.int64) + shift
 
     if mode.is_extend_without_speculative():
         # Prefill: per-token request rows and in-segment offsets.
@@ -500,14 +507,17 @@ def welm_spec_n_gram_input_ids(input_ids, positions, forward_batch, is_draft: bo
                     torch.int64
                 )
             return current
-        # Draft prefill: input j is target token j + 1 of the segment, so its
-        # grams are the target grams of token j + 1; the last token (the newly
-        # sampled one) reads its predecessors from the ring.
-        last = idx == lens - 1
-        nxt = torch.clamp(torch.arange(num_tokens, device=ids.device) + 1, max=num_tokens - 1)
+        # Draft prefill: input j is target token j + shift of the segment, so
+        # its grams are the target grams of token j + shift; the last ``shift``
+        # inputs (newly sampled / proposed tokens) read predecessors from the
+        # ring.  Positions near a segment end clamp but take the ring branch.
+        from_ring = idx >= lens - shift
+        nxt = torch.clamp(
+            torch.arange(num_tokens, device=ids.device) + shift, max=num_tokens - 1
+        )
         ring_grams = _welm_read_ring(ring, rows, tpos)
         grams = [
-            torch.where(last, rg, g.to(torch.int64)[nxt])
+            torch.where(from_ring, rg, g.to(torch.int64)[nxt])
             for rg, g in zip(ring_grams, current.input_ids_grams)
         ]
         return NGramInputIds(input_ids_grams=grams)
@@ -639,11 +649,16 @@ class LayerManager:
         if is_nextn:
             LayerManager.num_nextn_predict_layer_idx = kv_mirror_layers
         for mirror_layer_id in kv_mirror_layers:
-            if mirror_layer_id >= len(LayerManager.decoder_layer):
-                continue
             imitated_layer_id = kv_mirror_imitated_layers[
                 kv_mirror_layers.index(mirror_layer_id)
             ]
+            # ``decoder_layer`` is keyed by global layer id and may be sparse
+            # (per-step MTP draft models register only their own layer).
+            if (
+                mirror_layer_id not in LayerManager.decoder_layer
+                or imitated_layer_id not in LayerManager.decoder_layer
+            ):
+                continue
             mirror_layer_attn = LayerManager.decoder_layer[mirror_layer_id].self_attn
             imitated_layer_attn = LayerManager.decoder_layer[
                 imitated_layer_id
@@ -694,14 +709,11 @@ class LayerManager:
             source_biases = list(
                 getattr(imitated_layer_attn, "welm_kv_mirror_source_biases", [])
             )
-            source_ids.append(mirror_layer_id)
-            source_weights.append(
-                mirror_qkv_proj_weight[
-                    mirror_layer_attn.q_size : mirror_layer_attn.q_size
-                    + 2 * mirror_layer_attn.kv_size
-                ]
-            )
-            source_biases.append(
+            mirror_kv_weight = mirror_qkv_proj_weight[
+                mirror_layer_attn.q_size : mirror_layer_attn.q_size
+                + 2 * mirror_layer_attn.kv_size
+            ]
+            mirror_kv_bias = (
                 None
                 if mirror_qkv_proj_bias is None
                 else mirror_qkv_proj_bias[
@@ -709,6 +721,16 @@ class LayerManager:
                     + 2 * mirror_layer_attn.kv_size
                 ]
             )
+            # post_init runs before and after weight loading; re-registering a
+            # mirror layer must replace its entry, not project it twice.
+            if mirror_layer_id in source_ids:
+                slot = source_ids.index(mirror_layer_id)
+                source_weights[slot] = mirror_kv_weight
+                source_biases[slot] = mirror_kv_bias
+            else:
+                source_ids.append(mirror_layer_id)
+                source_weights.append(mirror_kv_weight)
+                source_biases.append(mirror_kv_bias)
             imitated_layer_attn.welm_kv_mirror_source_ids = source_ids
             imitated_layer_attn.welm_kv_mirror_source_weights = source_weights
             imitated_layer_attn.welm_kv_mirror_source_biases = source_biases
@@ -2848,7 +2870,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         break
                 # For decoder layer weights
                 if is_decoder:
-                    weight_suffix = int(next_layer_prefix.split(".")[-1])
+                    # Use the matched layer, not the loop's last prefix:
+                    # otherwise every MTP layer's block loads into the last
+                    # decoder slot and the others stay uninitialised.
+                    weight_suffix = int(matched_prefix.split(".")[-1])
                     name = name.replace(
                         matched_prefix,
                         f"model.decoder_layers.{weight_suffix-num_target_layers}",

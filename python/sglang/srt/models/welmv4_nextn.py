@@ -19,7 +19,9 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     WelmV4FusedRMSNorm,
@@ -86,6 +88,7 @@ class WeLMV4ModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        draft_model_idx: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -103,6 +106,14 @@ class WeLMV4ModelNextN(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=True)
 
+        # Each checkpoint MTP layer is a complete module (eh_proj, norms,
+        # block, head).  Multi-layer EAGLE builds one draft model per step and
+        # passes ``draft_model_idx`` so that step runs only its own layer.
+        mtp_layer_ids = (
+            [draft_model_idx]
+            if draft_model_idx is not None
+            else range(config.num_nextn_predict_layers)
+        )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.decoder_layers = nn.ModuleList(
             [
@@ -114,9 +125,12 @@ class WeLMV4ModelNextN(nn.Module):
                     prefix=add_prefix("decoder", prefix),
                     alt_stream=self.alt_stream,
                 )
-                for i in range(config.num_nextn_predict_layers)
+                for i in mtp_layer_ids
             ]
         )
+        # Multi-layer EAGLE step k feeds inputs shifted by ``1 + k`` tokens
+        # relative to their positions (each step rotates the window once more).
+        self.draft_token_shift = 1 + (draft_model_idx or 0)
 
         self.shared_head = nn.Module()
         self.shared_head.norm = WelmV4FusedRMSNorm(
@@ -157,7 +171,8 @@ class WeLMV4ModelNextN(nn.Module):
     ) -> torch.Tensor:
         if len(self.oe_grams) > 0:
             forward_batch.n_gram_input_ids = welm_spec_n_gram_input_ids(
-                input_ids, positions, forward_batch, is_draft=True
+                input_ids, positions, forward_batch, is_draft=True,
+                draft_shift=self.draft_token_shift,
             )
         if (
             input_embeds is None
@@ -270,17 +285,33 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        draft_model_idx: Optional[int] = None,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        self.draft_model_idx = draft_model_idx
 
         self.model = WeLMV4ModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            draft_model_idx=draft_model_idx,
         )
         self.lm_head = None
+        # Some checkpoints train a dedicated MTP output head
+        # (``shared_head.head``) that differs from the target lm_head; drafting
+        # with the target head then lowers acceptance.  Load it and decide in
+        # set_embed_and_head whether it is needed.
+        self.mtp_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("mtp_head", prefix),
+        )
+        self._mtp_head_loaded = False
         self.logits_processor = LogitsProcessor(config)
         super().post_init_after_load_weights(is_nextn=True)
 
@@ -312,7 +343,58 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+        if self.draft_model_idx is not None:
+            weights = select_mtp_layer_weights(
+                self.config, weights, self.draft_model_idx
+            )
+        super().load_weights(self._take_mtp_head(weights), is_nextn=True)
+
+    def _take_mtp_head(self, weights):
+        # After select_mtp_layer_weights the active MTP layer is always the
+        # first one; the base NextN loader skips shared_head.head.
+        head_name = (
+            f"model.layers.{self.config.num_target_hidden_layers}"
+            ".shared_head.head.weight"
+        )
+        for name, tensor in weights:
+            if name == head_name:
+                param = self.mtp_head.weight
+                getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+                self._mtp_head_loaded = True
+                continue
+            yield name, tensor
+
+    def set_embed_and_head(self, embed, head):
+        super().set_embed_and_head(embed, head)
+        if self.mtp_head is None:
+            return
+        if self._mtp_head_loaded and not torch.equal(
+            self.mtp_head.weight, head.weight
+        ):
+            self.lm_head = self.mtp_head
+        else:
+            # Identical to (or absent in favour of) the target head: share it
+            # and release the duplicate.
+            self.mtp_head = None
+            torch.cuda.empty_cache()
+
+
+def select_mtp_layer_weights(config, weights, draft_model_idx: int):
+    """Keep only MTP layer ``num_target + idx`` and present it as the first
+    MTP layer, which the base NextN loader maps onto ``decoder_layers.0`` and
+    the model-level eh_proj / enorm / hnorm / shared_head."""
+    num_target = config.num_target_hidden_layers
+    first_prefix = f"model.layers.{num_target}."
+    keep_prefix = f"model.layers.{num_target + draft_model_idx}."
+    mtp_prefixes = tuple(
+        f"model.layers.{num_target + i}."
+        for i in range(config.num_nextn_predict_layers)
+    )
+    for name, tensor in weights:
+        if name.startswith(keep_prefix):
+            yield first_prefix + name[len(keep_prefix):], tensor
+        elif not name.startswith(mtp_prefixes):
+            yield name, tensor
 
 
 EntryClass = WeLMV4MoeForCausalLMNextN

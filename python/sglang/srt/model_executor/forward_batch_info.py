@@ -98,6 +98,27 @@ def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
 _WELM_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
 
 
+def _needs_extend_input_logprobs(forward_batch) -> bool:
+    """Whether an extend batch must return logprobs for prompt positions.
+
+    Mirrors ``LogitsMetadata.from_forward_batch``: a request needs input
+    logprobs when its logprob start lies before the end of its extend span.
+    """
+    mode = forward_batch.forward_mode
+    if (
+        mode is None
+        or not mode.is_extend()
+        or mode.is_target_verify()
+        or not forward_batch.return_logprob
+    ):
+        return False
+    starts = forward_batch.extend_logprob_start_lens_cpu
+    lens = forward_batch.extend_seq_lens_cpu
+    if not starts or not lens:
+        return False
+    return any(extend_len - start_len > 0 for extend_len, start_len in zip(lens, starts))
+
+
 def _resize_welm_mirror_states(
     model_specific_states: Optional[Dict[str, any]], size: int, *, pad: bool
 ):
@@ -1115,6 +1136,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+
+        # KV-mirror prefill keeps only each request's last hidden state, so it
+        # cannot produce prompt-position logprobs.  Run such batches through
+        # the full (exact, slower) path instead of failing in the scheduler.
+        if ret.enable_kv_mirror and _needs_extend_input_logprobs(ret):
+            ret.enable_kv_mirror = False
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)

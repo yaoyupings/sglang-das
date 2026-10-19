@@ -621,7 +621,13 @@ class WeLMV4VisionProjector(nn.Module):
 
 
 class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
-    def __init__(self, config: PretrainedConfig, quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config=None,
+        prefix: str = "",
+        draft_model_idx: Optional[int] = None,
+    ):
         if not hasattr(config, "text_config"):
             raise ValueError("WeLMV4 VLM config must contain text_config.")
         text_config = _as_config(config.text_config)
@@ -648,8 +654,12 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             nn.Module.__init__(self)
             self.pp_group = get_pp_group()
             self.config = text_config
+            self.draft_model_idx = draft_model_idx
             self.model = WeLMV4ModelNextN(
-                text_config, quant_config, prefix=add_prefix("model", prefix)
+                text_config,
+                quant_config,
+                prefix=add_prefix("model", prefix),
+                draft_model_idx=draft_model_idx,
             )
             self.lm_head = None
             self.logits_processor = LogitsProcessor(text_config)
@@ -728,9 +738,24 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         is_nextn = is_nextn or self._is_nextn
+        if self._is_nextn and getattr(self, "draft_model_idx", None) is not None:
+            from sglang.srt.models.welmv4_nextn import select_mtp_layer_weights
+
+            weights = select_mtp_layer_weights(
+                self.config, weights, self.draft_model_idx
+            )
         params_dict = dict(self.named_parameters())
         language_only = getattr(self.vlm_config, "language_only", False)
         encoder_only = getattr(self.vlm_config, "encoder_only", False)
+        # The base loader silently skips names it cannot place.  Vision
+        # parameters left unloaded keep uninitialised memory and produce
+        # garbage image embeddings, so track them and fail loudly instead.
+        vision_params = {
+            n for n in params_dict
+            if n.startswith(("vision_encoder.", "vision_projector."))
+        }
+        loaded_vision: set = set()
+        unmatched_vision: list = []
 
         def load_qkv_weights_and_forward_others():
             for name, loaded_weight in weights:
@@ -749,10 +774,28 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
                     param = params_dict.get(qkv_name)
                     if param is not None:
                         param.weight_loader(param, loaded_weight)
+                        loaded_vision.add(qkv_name)
+                    else:
+                        unmatched_vision.append(name)
                     continue
+                if name.startswith(("vision_encoder.", "vision_projector.")):
+                    if name in params_dict:
+                        loaded_vision.add(name)
+                    else:
+                        unmatched_vision.append(name)
                 yield name, loaded_weight
 
         super().load_weights(load_qkv_weights_and_forward_others(), is_nextn=is_nextn)
+
+        if vision_params and not language_only and not is_nextn:
+            missing = sorted(vision_params - loaded_vision)
+            if missing or unmatched_vision:
+                raise RuntimeError(
+                    "WeLMV4 VLM vision weights not loaded: "
+                    f"{len(missing)} parameters never loaded (e.g. {missing[:8]}), "
+                    f"{len(unmatched_vision)} checkpoint tensors unmatched "
+                    f"(e.g. {unmatched_vision[:8]})."
+                )
 
     def _image_token_id(self) -> int:
         image_token_id = getattr(self.config, "image_token_id", None)
@@ -923,6 +966,14 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors=None,
     ) -> torch.Tensor:
+        if self._is_nextn:
+            # Share the language NextN forward (pre-norm hidden capture for
+            # chained MTP steps) instead of the target causal-LM forward.
+            from sglang.srt.models.welmv4_nextn import WeLMV4MoeForCausalLMNextN
+
+            return WeLMV4MoeForCausalLMNextN.forward(
+                self, input_ids, positions, forward_batch, input_embeds
+            )
         has_image_inputs = (
             getattr(self.config, "image_token_id", None) is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
