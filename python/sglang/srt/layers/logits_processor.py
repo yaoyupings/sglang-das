@@ -67,6 +67,13 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
+from sglang.srt.utils import get_bool_env_var as _get_bool_env_var
+from sglang.srt.utils import is_hcu as _is_hcu_fn
+
+_hcu_skinny_lm_head = _is_hcu_fn() and _get_bool_env_var(
+    "SGLANG_HCU_SKINNY_GEMM", "true"
+)
+
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
     "UnquantizedLinearMethod",
@@ -105,6 +112,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Model-owned state handed from target forward to draft extend.
+    model_specific_states: Optional[Dict[str, Any]] = None
     # Draft decode VP returns a deterministic top-1 proposal without full logits.
     draft_top1_token_ids: Optional[torch.Tensor] = None
     draft_top1_probs: Optional[torch.Tensor] = None
@@ -917,9 +926,16 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                hs = hidden_states.to(lm_head.weight.dtype)
+                if _hcu_skinny_lm_head and hs.dim() == 2:
+                    from sglang.srt.layers.welmv4_fast_op import (
+                        skinny_gemm,
+                        skinny_gemm_supported,
+                    )
+
+                    if skinny_gemm_supported(hs, lm_head.weight):
+                        return skinny_gemm(hs, lm_head.weight)
+                logits = torch.matmul(hs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

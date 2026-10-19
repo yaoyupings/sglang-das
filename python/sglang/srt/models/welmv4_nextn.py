@@ -27,12 +27,57 @@ from sglang.srt.models.welmv4 import (
     hash_input_ids_vectorized,
     welm_mtp_mirror_kv,
     welm_spec_n_gram_input_ids,
+    _empty_welm_kv_mirror_states,
+    _get_welm_kv_mirror_states,
+    _set_welm_kv_mirror_states,
+    _can_fuse_embed_ar,
+    welm_embed_with_oe,
 )
 from sglang.srt.utils import add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+
+
+def _welm_trace_draft_logits(forward_batch, input_ids, positions, logits_output):
+    """Optional low-volume draft-logit/state trace for MTP diagnosis."""
+    path = os.getenv("WELM_TRACE_DRAFT_LOGITS")
+    if not path:
+        return
+    try:
+        states = getattr(forward_batch, "model_specific_states", None) or {}
+        mirror = states.get("welm_kv_mirror_states", {})
+        trace = {
+            "mode": str(forward_batch.forward_mode),
+            "input_shape": tuple(input_ids.shape),
+            "position_shape": tuple(positions.shape),
+            "input_head": input_ids[:8].detach().cpu().tolist(),
+            "position_head": positions[:8].detach().cpu().tolist(),
+            "state_keys": sorted(str(k) for k in mirror),
+            "state_shapes": {
+                str(k): (tuple(v[0].shape), tuple(v[1].shape))
+                for k, v in mirror.items()
+            },
+        }
+        logits = getattr(logits_output, "next_token_logits", None)
+        if isinstance(logits, torch.Tensor) and logits.numel() > 0:
+            rows = [0] if logits.shape[0] == 1 else [0, logits.shape[0] - 1]
+            trace["logit_rows"] = []
+            for row in rows:
+                values, ids = torch.topk(logits[row].float(), k=5)
+                trace["logit_rows"].append(
+                    {
+                        "row": row,
+                        "ids": ids.detach().cpu().tolist(),
+                        "values": values.detach().cpu().tolist(),
+                    }
+                )
+        with open(path, "a", encoding="utf-8") as f:
+            import json
+            f.write(json.dumps(trace, sort_keys=True) + "\n")
+    except Exception:
+        logger.exception("WeLM draft trace failed")
 
 
 class WeLMV4ModelNextN(nn.Module):
@@ -52,6 +97,7 @@ class WeLMV4ModelNextN(nn.Module):
         self.oe_gate_up_proj = None
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
+        self.scale_seq_times = getattr(config, "scale_seq_times", 0)
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -107,23 +153,48 @@ class WeLMV4ModelNextN(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        **kwargs,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-
         if len(self.oe_grams) > 0:
             forward_batch.n_gram_input_ids = welm_spec_n_gram_input_ids(
                 input_ids, positions, forward_batch, is_draft=True
             )
-            hidden_states = self._oe_embedding(input_ids, forward_batch, hidden_states)
+        if (
+            input_embeds is None
+            and len(self.oe_grams) > 0
+            and input_ids.shape[0] > 0
+            and _can_fuse_embed_ar(self.embed_tokens, self.oe_embed)
+        ):
+            hidden_states = welm_embed_with_oe(
+                self.embed_tokens, self.oe_embed, self.oe_gate_up_proj, input_ids,
+                forward_batch.n_gram_input_ids, self.vocab_size, self.oe_grams,
+                self.oe_vocab_sizes,
+            )
+        else:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            if len(self.oe_grams) > 0:
+                hidden_states = self._oe_embedding(input_ids, forward_batch, hidden_states)
+
+        if len(self.oe_grams) > 0:
             mode = forward_batch.forward_mode
+            # Target verify already publishes the mirror K/V tensors needed by
+            # draft-extend.  Reconstructing them from the n-gram ring here
+            # loses the accepted-tree row mapping after variable rejection and
+            # can overwrite the target state with rows for a different path.
+            # Ordinary draft decode has no target forward in the same call, so
+            # it still needs the ring-based reconstruction fallback.
             if (
                 os.environ.get("WELM_MTP_DECODE_MIRROR", "1") == "1"
                 and not mode.is_idle()
                 and not mode.is_extend_without_speculative()
                 and input_ids.shape[0] > 0
+                and (
+                    not mode.is_draft_extend_v2()
+                    or not _get_welm_kv_mirror_states(forward_batch)
+                )
             ):
                 welm_mtp_mirror_kv(
                     input_ids,
@@ -164,13 +235,19 @@ class WeLMV4ModelNextN(nn.Module):
         residual = None
         final_experts_output = None
         final_shared_output = None
+        kv_mirror_states = _get_welm_kv_mirror_states(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             for layer in self.decoder_layers:
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
+                hidden_states, residual, kv_mirror_states = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    kv_mirror_states,
                 )
                 final_experts_output = getattr(layer, "final_mlp_experts_output", None)
                 final_shared_output = getattr(layer, "final_mlp_shared_output", None)
+        _set_welm_kv_mirror_states(forward_batch, kv_mirror_states)
 
         pre_norm_hidden_states = hidden_states
         if not forward_batch.forward_mode.is_idle():
@@ -227,9 +304,12 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
             and os.environ.get("WELM_MTP_DRAFT_PRENORM", "1") == "1"
         ):
             aux_hidden_states = [pre_norm_hidden_states]
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+        _welm_trace_draft_logits(forward_batch, input_ids, positions, logits_output)
+        logits_output.model_specific_states = forward_batch.model_specific_states
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

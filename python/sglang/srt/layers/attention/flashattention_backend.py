@@ -1625,7 +1625,6 @@ class FlashAttentionBackend(AttentionBackend):
                         and not layer.is_cross_attention
                         and not use_local_attn
                         and not use_cascade_attn
-                        and not is_swa_layer
                         else None
                     ),
                 )

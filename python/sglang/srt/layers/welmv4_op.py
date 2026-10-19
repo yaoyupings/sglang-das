@@ -75,7 +75,7 @@ def mmq_style_router_linear_kernel(  # pylint: disable=too-many-arguments,too-ma
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    NUM_SMS: tl.constexpr,
+    NUM_SMS,  # runtime: a constexpr here recompiles per row count
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -289,7 +289,7 @@ def mmq_style_norm_after_attn_kernel(
     rows: int,
     cols: tl.constexpr,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # runtime: a constexpr here recompiles per row count
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
@@ -364,7 +364,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_kv_stride: int,
     residual_row_stride: int,
     residual_after_layernorm: tl.constexpr,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # runtime: a constexpr here recompiles per row count
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     row_start = tl.program_id(0)
@@ -476,7 +476,76 @@ class WelmV4FusedRMSNorm(CustomOp):
             return output, out_residual
 
 
+# The ops below are used inside the vision encoder of ``welmv4_vlm`` — they
+# are NOT part of the LLM decoder path. They mirror the matching kernels in
+# the upstream WeLMV4 training stack so the inference forward stays
+# numerically aligned with training.
+#
+# If you touch these, keep them semantically equivalent to the upstream
+# sources they were ported from.
+# ---------------------------------------------------------------------------
+
+
+# QuickGELU activation: ``out = x * sigmoid(1.702 * x)`` with fp32 compute
+# and an implicit cast back to the input dtype on store.
+_QUICK_GELU_SLOPE = 1.702
+
+
 @triton.jit
+def _welmv4_vision_quick_gelu_fwd_kernel(
+    x_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    n_elements: int,
+    slope: tl.constexpr,
+    num_sms: tl.constexpr,
+    block_size: tl.constexpr,
+    num_stages: tl.constexpr = 2,
+):
+    pid = tl.program_id(axis=0)
+    for block_start in tl.range(
+        pid * block_size, n_elements, num_sms * block_size, num_stages=num_stages
+    ):
+        offsets = (block_start + tl.arange(0, block_size)).to(tl.int64)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask, other=0)
+        x_fp32 = x.to(tl.float32)
+        out = x_fp32 * tl.sigmoid(slope * x_fp32)
+        tl.store(out_ptr + offsets, out, mask=mask)
+
+
+def welmv4_vision_quick_gelu(x: torch.Tensor) -> torch.Tensor:
+    """QuickGELU activation used inside ``WeLMV4VisionMLP``.
+
+    Computes ``x * sigmoid(1.702 * x)`` with fp32 accumulation and casts
+    back to the input dtype on store. Only used by the WeLMV4 vision
+    encoder; do not call this from the LLM decoder.
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    out = torch.empty_like(x)
+    n_elements = x.numel()
+    if n_elements == 0:
+        return out
+    # ``num_sms`` only controls how many CTAs launch — the ``tl.range``
+    # stride in the kernel keeps the output correct for any value. 132 is
+    # an upper bound that matches the H100 SM count.
+    num_sms = 132
+    block_size = 1024
+    with torch.cuda.device(x.device):
+        _welmv4_vision_quick_gelu_fwd_kernel[(num_sms,)](
+            x_ptr=x,
+            out_ptr=out,
+            n_elements=n_elements,
+            slope=_QUICK_GELU_SLOPE,
+            num_sms=num_sms,
+            block_size=block_size,
+        )
+    return out
+
+
+@triton.jit
+
+
 def mmq_style_shared_experts_add_residual_rms_norm_kernel(
     experts_output_ptr: tl.tensor,
     shared_output_ptr: tl.tensor,
@@ -486,7 +555,7 @@ def mmq_style_shared_experts_add_residual_rms_norm_kernel(
     rows: int,
     cols: tl.constexpr,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # runtime: a constexpr here recompiles per row count
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     row_start = tl.program_id(0)
@@ -557,7 +626,7 @@ def mmq_style_k_rms_norm_kernel(
     x_token_stride: int,
     out_token_stride: int,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
+    NUM_SMS,  # runtime: a constexpr here recompiles per row count
     KV_HEADS_BLOCK: tl.constexpr,  # pylint: disable=invalid-name
 ):
     head_dim_offs = tl.arange(0, head_dim)
@@ -608,7 +677,7 @@ def sigmoid_mul_kernel(
     cols: tl.constexpr,
     y_row_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    NUM_SMS: tl.constexpr,
+    NUM_SMS,  # runtime: a constexpr here recompiles per row count
 ):
     row_start = tl.program_id(0)
     col_off = tl.arange(0, BLOCK_SIZE)
@@ -674,7 +743,7 @@ def _welmv4_inplace_rope_kernel(
     k_token_stride: tl.constexpr,
     head_dim: tl.constexpr,
     rope_dim: tl.constexpr,
-    num_sms: tl.constexpr,
+    num_sms,  # runtime: a constexpr here recompiles per token count
     num_stages: tl.constexpr,
     num_q_heads: tl.constexpr,
     num_k_heads: tl.constexpr,
@@ -788,3 +857,260 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+
+# ---------------------------------------------------------------------------
+# Vision-encoder RoPE (WeLMV4 VLM only)
+#
+# Half-rotate RoPE applied to the q and k slots of a packed
+# ``(seq_len, q_heads + 2*kv_heads, head_dim)`` qkv tensor; the v slot is
+# copied through unchanged. The kernel uses one fused FMA in fp32 and
+# stores the result as bf16, which is more numerically stable than the
+# eager ``mul -> rotate-half -> mul -> add -> cast`` sequence used by
+# the generic vision RoPE in ``sglang.srt.layers.attention.vision``.
+#
+# The kernel works for any even ``head_dim`` (we pad the inner
+# ``head_dim/2`` axis up to the next power of 2 and mask the unused tail),
+# so it is not subject to the power-of-2 constraint of generic
+# ``qkv_part_rope`` triton implementations. WeLMV4 ships with
+# ``head_dim = 72`` so the masking is required, not optional.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _welmv4_qk_part_rope_kernel(  # pylint: disable=too-many-arguments,too-many-locals
+    qkv_ptr: tl.tensor,
+    cos_ptr: tl.tensor,
+    sin_ptr: tl.tensor,
+    qkv_out_ptr: tl.tensor,
+    qkv_row_stride: tl.constexpr,
+    cos_row_stride: tl.constexpr,
+    sin_row_stride: tl.constexpr,
+    seq_len: tl.int64,
+    qk_rope_head_dim: tl.constexpr,
+    q_heads: tl.constexpr,
+    kv_heads: tl.constexpr,
+    num_sms: tl.constexpr,
+    num_stages: tl.constexpr,
+    q_heads_pow2: tl.constexpr,  # heuristic
+    kv_heads_pow2: tl.constexpr,  # heuristic
+    half_rope_dim_pow2: tl.constexpr,  # heuristic; pad of qk_rope_head_dim//2
+):
+    """Apply the half-rotate RoPE formula to the q and k slots of a
+    packed ``(seq_len, q_heads + 2*kv_heads, head_dim)`` qkv tensor.
+    The v slot is copied through as-is. ``head_dim`` here equals
+    ``qk_rope_head_dim`` — we don't support a non-zero
+    ``qk_nope_head_dim`` because WeLMV4 doesn't need it (and the
+    extra branching would just be dead code).
+
+    The kernel is layout-equivalent to a generic qkv_part_rope triton
+    kernel, with the head_dim power-of-2 constraint relaxed via masking.
+    """
+    half_rope_head_dim: tl.constexpr = qk_rope_head_dim // 2
+    # 1D arange of length pow2, mask off the unused tail. half_rope_dim_pow2
+    # is the next-power-of-2 of half_rope_head_dim (e.g. 64 for half=36).
+    half_offs = tl.arange(0, half_rope_dim_pow2)
+    half_mask = half_offs < half_rope_head_dim
+
+    # Persistent CTA loop over seq tokens.
+    for seq_id in tl.range(tl.program_id(0), seq_len, num_sms, num_stages=num_stages):
+        seq64 = seq_id.to(tl.int64)
+        cos = tl.load(
+            cos_ptr + seq64 * cos_row_stride + half_offs, mask=half_mask, other=0.0
+        )
+        sin = tl.load(
+            sin_ptr + seq64 * sin_row_stride + half_offs, mask=half_mask, other=0.0
+        )
+
+        token_offs = seq64 * qkv_row_stride
+
+        # ---- q slot ----
+        q_heads_offs = tl.arange(0, q_heads_pow2)
+        q_head_mask = q_heads_offs < q_heads
+        # offsets for the lo half (first half_rope_head_dim of each head)
+        offs_q_lo = (
+            token_offs + q_heads_offs[:, None] * qk_rope_head_dim + half_offs[None, :]
+        )
+        offs_q_hi = offs_q_lo + half_rope_head_dim
+        mask_q_lo = q_head_mask[:, None] & half_mask[None, :]
+        x_lo = tl.load(qkv_ptr + offs_q_lo, mask=mask_q_lo, other=0.0).to(tl.float32)
+        x_hi = tl.load(qkv_ptr + offs_q_hi, mask=mask_q_lo, other=0.0).to(tl.float32)
+        out_lo = x_lo * cos[None, :] - x_hi * sin[None, :]
+        out_hi = x_lo * sin[None, :] + x_hi * cos[None, :]
+        tl.store(qkv_out_ptr + offs_q_lo, out_lo, mask=mask_q_lo)
+        tl.store(qkv_out_ptr + offs_q_hi, out_hi, mask=mask_q_lo)
+
+        # ---- k slot (offset by q_heads * head_dim from start of token) ----
+        kv_heads_offs = tl.arange(0, kv_heads_pow2)
+        kv_head_mask = kv_heads_offs < kv_heads
+        k_token_offs = token_offs + q_heads * qk_rope_head_dim
+        offs_k_lo = (
+            k_token_offs
+            + kv_heads_offs[:, None] * qk_rope_head_dim
+            + half_offs[None, :]
+        )
+        offs_k_hi = offs_k_lo + half_rope_head_dim
+        mask_k_lo = kv_head_mask[:, None] & half_mask[None, :]
+        x_lo = tl.load(qkv_ptr + offs_k_lo, mask=mask_k_lo, other=0.0).to(tl.float32)
+        x_hi = tl.load(qkv_ptr + offs_k_hi, mask=mask_k_lo, other=0.0).to(tl.float32)
+        out_lo = x_lo * cos[None, :] - x_hi * sin[None, :]
+        out_hi = x_lo * sin[None, :] + x_hi * cos[None, :]
+        tl.store(qkv_out_ptr + offs_k_lo, out_lo, mask=mask_k_lo)
+        tl.store(qkv_out_ptr + offs_k_hi, out_hi, mask=mask_k_lo)
+
+        # ---- v slot: copy through unchanged ----
+        v_token_offs = k_token_offs + kv_heads * qk_rope_head_dim
+        # Load full head_dim (rope+nope, but here qk_nope_head_dim=0 so
+        # just head_dim) for each kv head; since head_dim isn't pow2 we
+        # use two arange-pow2 chunks.
+        offs_v_lo = (
+            v_token_offs
+            + kv_heads_offs[:, None] * qk_rope_head_dim
+            + half_offs[None, :]
+        )
+        offs_v_hi = offs_v_lo + half_rope_head_dim
+        v_lo = tl.load(qkv_ptr + offs_v_lo, mask=mask_k_lo, other=0.0)
+        v_hi = tl.load(qkv_ptr + offs_v_hi, mask=mask_k_lo, other=0.0)
+        tl.store(qkv_out_ptr + offs_v_lo, v_lo, mask=mask_k_lo)
+        tl.store(qkv_out_ptr + offs_v_hi, v_hi, mask=mask_k_lo)
+
+
+def welmv4_vision_qkv_part_rope(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    num_sms: int = 132,
+) -> torch.Tensor:
+    """Apply half-rotate RoPE to the q and k slots of ``qkv`` and copy the
+    v slot through unchanged. Returns a new bf16 tensor of the same shape.
+
+    Args:
+        qkv: ``(seq_len, q_heads + 2*kv_heads, head_dim)`` bf16,
+            contiguous. ``head_dim`` must be even but does NOT need to
+            be a power of 2 (we mask).
+        cos / sin: ``(seq_len, head_dim/2)`` fp32, contiguous.
+        q_heads: number of q heads.
+        kv_heads: number of k (== number of v) heads.
+
+    Returns:
+        ``qkv_out`` bf16, same shape as ``qkv``.
+    """
+    if qkv.dtype != torch.bfloat16:
+        raise TypeError(f"qkv must be bf16, got {qkv.dtype}")
+    if qkv.dim() != 3:
+        raise ValueError(f"qkv must be 3D (seq, heads*3, head_dim), got {qkv.shape}")
+    seq_len, total_heads, head_dim = qkv.shape
+    if total_heads != q_heads + 2 * kv_heads:
+        raise ValueError(
+            f"total_heads={total_heads} != q_heads({q_heads}) + 2*kv_heads({kv_heads})"
+        )
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {head_dim}")
+    half = head_dim // 2
+    if cos.shape != (seq_len, half) or sin.shape != (seq_len, half):
+        raise ValueError(
+            f"cos/sin must be (seq_len={seq_len}, head_dim/2={half}); "
+            f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
+        )
+    if cos.dtype != torch.float32:
+        cos = cos.to(torch.float32)
+    if sin.dtype != torch.float32:
+        sin = sin.to(torch.float32)
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    if not qkv.is_contiguous():
+        qkv = qkv.contiguous()
+
+    qkv_out = torch.empty_like(qkv)
+    q_heads_pow2 = triton.next_power_of_2(q_heads)
+    kv_heads_pow2 = triton.next_power_of_2(kv_heads)
+    half_rope_dim_pow2 = triton.next_power_of_2(half)
+    num_stages = 3
+
+    with torch.cuda.device(qkv.device):
+        _welmv4_qk_part_rope_kernel[(num_sms,)](
+            qkv_ptr=qkv,
+            cos_ptr=cos,
+            sin_ptr=sin,
+            qkv_out_ptr=qkv_out,
+            qkv_row_stride=total_heads * head_dim,  # row stride in elements
+            cos_row_stride=cos.stride(0),
+            sin_row_stride=sin.stride(0),
+            seq_len=seq_len,
+            qk_rope_head_dim=head_dim,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            num_sms=num_sms,
+            num_stages=num_stages,
+            q_heads_pow2=q_heads_pow2,
+            kv_heads_pow2=kv_heads_pow2,
+            half_rope_dim_pow2=half_rope_dim_pow2,
+        )
+    return qkv_out
+
+
+def welmv4_vision_apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply WeLMV4 vision-encoder RoPE to ``q`` and ``k``.
+
+    Packs ``(q, k, v_pad)`` into the layout the triton kernel expects,
+    runs ``welmv4_vision_qkv_part_rope``, and unpacks ``q_out`` and
+    ``k_out``.
+
+    Args:
+        q: ``(seq_len, num_heads, head_dim)`` bf16. Contiguous; the
+            function will make a contiguous copy if not.
+        k: same shape as ``q``.
+        cos / sin: either ``(seq_len, head_dim)`` (the SGLang vision
+            encoder concatenates ``cos`` with itself before calling the
+            applier) or ``(seq_len, head_dim/2)``. fp32 is preferred;
+            bf16 is upcast inside ``welmv4_vision_qkv_part_rope``.
+
+    Returns:
+        ``(q_out, k_out)`` bf16, same shapes as the inputs.
+    """
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
+        raise TypeError(
+            f"welmv4_vision_apply_rope expects bf16 q/k; "
+            f"got q.dtype={q.dtype}, k.dtype={k.dtype}"
+        )
+    if q.dim() != 3 or k.shape != q.shape:
+        raise ValueError(
+            f"welmv4_vision_apply_rope expects q,k of shape (seq, heads, head_dim) "
+            f"with q.shape == k.shape; got q={tuple(q.shape)}, k={tuple(k.shape)}"
+        )
+    seq_len, num_heads, head_dim = q.shape
+
+    # SGLang's vision encoder forward concatenates ``cos`` with itself
+    # before passing it here (``cos = torch.cat([cos, cos], dim=-1)``).
+    # The kernel only consumes the first ``head_dim/2`` columns; slice
+    # them off so callers don't need to special-case.
+    half = head_dim // 2
+    if cos.shape[-1] == head_dim:
+        cos = cos[..., :half]
+        sin = sin[..., :half]
+
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not k.is_contiguous():
+        k = k.contiguous()
+
+    v_pad = torch.zeros_like(q)
+    qkv_in = torch.stack([q, k, v_pad], dim=1).flatten(1, 2).contiguous()
+    qkv_out = welmv4_vision_qkv_part_rope(
+        qkv=qkv_in,
+        cos=cos,
+        sin=sin,
+        q_heads=num_heads,
+        kv_heads=num_heads,
+    )
+    qkv_out = qkv_out.view(seq_len, 3, num_heads, head_dim)
+    q_out = qkv_out[:, 0].contiguous()
+    k_out = qkv_out[:, 1].contiguous()
+    return q_out, k_out

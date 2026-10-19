@@ -53,6 +53,9 @@ if _is_cuda:
 # Where the CUDA kernel's own small-batch single-block path stops: its
 # per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
 _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+_HCU_SMALL_ALIGN_MAX_NUMEL = int(
+    __import__("os").environ.get("SGLANG_HCU_SMALL_ALIGN_MAX_NUMEL", "2048")
+)
 
 
 @triton.jit
@@ -405,6 +408,19 @@ def moe_align_block_size(
         # Triton masks a row only when its sorted token id is
         # >= topk_ids.numel(); leaving the torch.empty buffer uninitialized
         # can turn padding into real tokens.
+        if topk_ids.numel() <= _HCU_SMALL_ALIGN_MAX_NUMEL:
+            # One launch (fill + count + cumsum + scatter) for decode sizes.
+            from sglang.srt.layers.welmv4_fast_op import moe_align_small
+
+            moe_align_small(
+                topk_ids,
+                num_experts,
+                block_size,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+            )
+            return sorted_ids, expert_ids, num_tokens_post_pad
         sorted_ids.fill_(topk_ids.numel())
         # LightOp's count/sort scratch overflows for batched decode shapes.
         _hcu_moe_align_block_size_fast(

@@ -2058,6 +2058,28 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def welm_prefill_ngram_ids(fill_ids_list, prefix_lens):
+    """(3, total_extend_tokens) int64: token 1/2/3 positions back, 0 if none."""
+    import numpy as np
+
+    total = sum(len(f) - p for f, p in zip(fill_ids_list, prefix_lens))
+    out = np.zeros((3, total), dtype=np.int64)
+    pos = 0
+    for fill, pre in zip(fill_ids_list, prefix_lens):
+        L = len(fill)
+        n = L - pre
+        if n <= 0:
+            continue
+        start = max(0, pre - 3)
+        window = np.asarray(fill[start:], dtype=np.int64)
+        for row, k in enumerate((1, 2, 3)):
+            lo = max(pre, k)
+            if lo < L:
+                out[row, pos + lo - pre : pos + n] = window[lo - k - start : L - k - start]
+        pos += n
+    return out
+
+
 @dataclasses.dataclass
 class NGramInputIds:
     """Shifted token IDs used by WeLM over-encoding embeddings."""
@@ -2492,23 +2514,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
+        # The n-gram table for gram ``n`` consumes the token ``n - 1``
+        # positions back (matches the decode path). Built from a short numpy
+        # window per request and copied to the device once.
+        grams = welm_prefill_ngram_ids(
+            [req.get_fill_ids() for req in reqs],
+            [len(req.prefix_indices) for req in reqs],
+        )
+        grams = torch.from_numpy(grams)
+        if _pin:
+            grams = grams.pin_memory()
+        grams = grams.to(self.device, non_blocking=True)
         self.n_gram_input_ids = NGramInputIds(
-            input_ids_grams=[
-                torch.tensor(
-                    [
-                        token_ids
-                        for req in reqs
-                        # The n-gram table for gram ``n`` consumes the token
-                        # ``n - 1`` positions back (matches the decode path).
-                        for token_ids in NGramInputIds.get_token_ids_gram_n(
-                            req.get_fill_ids(), n - 1
-                        )[len(req.prefix_indices) :]
-                    ],
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-                for n in (2, 3, 4)
-            ]
+            input_ids_grams=[grams[0], grams[1], grams[2]]
         )
 
         self.extend_lens = extend_lens
@@ -3190,16 +3208,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # The decode input is the token immediately before the current input.
         # Build the shifted history consumed by WeLM's OE embedding tables.
+        # Only the last 4 tokens of origin_input_ids + output_ids are needed;
+        # avoid materializing the whole history per request every step.
         gram_lists = [[], [], []]
         for req in self.reqs:
-            ids = list(req.origin_input_ids) + list(req.output_ids)
+            out = req.output_ids
+            n_out = len(out)
+            total = len(req.origin_input_ids) + n_out
+            if n_out >= 4:
+                tail = out[-4:]
+            else:
+                tail = list(req.origin_input_ids[n_out - 4 :]) + list(out)
             for index, offset in enumerate((1, 2, 3)):
-                gram_lists[index].append(ids[-(1 + offset)] if len(ids) > offset else 0)
+                gram_lists[index].append(tail[-(1 + offset)] if total > offset else 0)
+        _pin = is_pin_memory_available(self.device)
+        grams = torch.tensor(gram_lists, dtype=torch.int64, pin_memory=_pin).to(
+            self.device, non_blocking=True
+        )
         self.n_gram_input_ids = NGramInputIds(
-            input_ids_grams=[
-                torch.tensor(values, dtype=torch.int64, device=self.device)
-                for values in gram_lists
-            ]
+            input_ids_grams=[grams[0], grams[1], grams[2]]
         )
 
         if self.model_config.is_encoder_decoder:

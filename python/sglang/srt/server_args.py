@@ -5881,7 +5881,10 @@ class ServerArgs:
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
 
-        if model_arch == "WeLMV4MoeForCausalLM":
+        if model_arch in [
+            "WeLMV4MoeForCausalLM",
+            "WeLMV4VLMForConditionalGeneration",
+        ]:
             self.prepare_n_gram_inputs = True
 
         if model_arch == "InternS2MobiusForConditionalGeneration":

@@ -830,8 +830,31 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "WeLMV4VLMForConditionalGeneration":
+            # The VLM keeps its language configuration under text_config.  A
+            # draft worker must expose only the physical NextN layers while
+            # retaining the target depth for KV-mirror layer numbering and
+            # checkpoint remapping.
+            text_config = self.hf_text_config
+            if getattr(text_config, "architectures", [None])[0] == "WeLMV4MoeForCausalLM":
+                target_hidden_layers = text_config.num_hidden_layers
+                text_config.num_target_hidden_layers = target_hidden_layers
+                text_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+                text_config.num_hidden_layers = (
+                    text_config.num_nextn_predict_layers
+                )
+
         if is_draft_model and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM":
+            # The flattened WeLM checkpoint stores the target decoder and the
+            # NextN decoder in one config.  Keep the target depth available to
+            # KV-mirror attention/weight loading before exposing only the
+            # physical NextN layers to the draft model.
+            target_hidden_layers = self.hf_config.num_hidden_layers
+            self.hf_config.num_target_hidden_layers = target_hidden_layers
             self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+            self.hf_config.num_hidden_layers = (
+                self.hf_config.num_nextn_predict_layers
+            )
 
         if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
@@ -2082,6 +2105,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "MllamaForConditionalGeneration",
         "MossVLForConditionalGeneration",
         "CLIPModel",
+        "WeLMV4VLMForConditionalGeneration",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
         return False

@@ -42,7 +42,12 @@ if _is_hcu:
         triton_vllm_flash_attn_with_kvcache,
     )
 
+import logging
+import os
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 _SERVER_ARGS = None
 IS_SLIMQUANT_W4A8 = None
@@ -326,6 +331,8 @@ def vllm_flash_attn_with_kvcache(
     ver=3,
     layout=None,
 ):
+    if WELM_Q_PRESCALED and softmax_scale is not None:
+        softmax_scale = q.shape[-1] ** -0.5
     if _is_hcu and _use_triton_vllm_fa:
         return triton_vllm_flash_attn_with_kvcache(
             q=q,
@@ -361,6 +368,17 @@ def vllm_flash_attn_with_kvcache(
         s_aux=sinks,
         num_splits=num_splits,
     )
+
+
+# Set by models that already folded softmax_scale / sqrt(1/head_dim) into q
+# (WeLM fuses it into its RoPE kernel); the HCU paged-attention wrappers then
+# use the default scale instead of rescaling q again.
+WELM_Q_PRESCALED = False
+
+
+_HCU_SHORT_Q_AS_DECODE_MAX = int(
+    os.environ.get("SGLANG_HCU_SHORT_Q_AS_DECODE_MAX", "8")
+)
 
 
 def _hcu_prescale_q_for_paged_attention(q, softmax_scale):
@@ -477,6 +495,107 @@ def flash_attn_varlen_func(
     return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
 
+def _hcu_paged_prefill_no_sync(
+    q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
+    softmax_scale, causal, window_size, block_table, total_k, sinks,
+    return_softmax_lse=False, out=None,
+):
+    """The vendor paged-prefill path (paged -> contiguous KV, then varlen_fwd)
+    with the workspace sized from a host-side KV total.
+
+    flash_attn's wrapper computes ``seqused_k.sum()`` and branches on it in
+    every layer, which blocks the CPU until all queued GPU work drains. Same
+    kernels and arguments otherwise, so results are bit-identical.
+    """
+    from flash_attn.flash_attn_interface import flash_attn_cuda
+
+    workspace_tokens = max(int(total_k), 256 * 1024)
+    nheads_kv = k.shape[1]
+    kt = torch.empty((workspace_tokens, nheads_kv, q.shape[-1]), device=q.device, dtype=k.dtype)
+    vt = torch.empty((workspace_tokens, nheads_kv, v.shape[-2]), device=q.device, dtype=v.dtype)
+    cu_k = torch.empty_like(cu_seqlens_q)
+    flash_attn_cuda.pagedkv_to_contiguouskv(
+        kt, vt, k, v, block_table, seqused_k, cu_k, max_seqlen_k, 0
+    )
+    if window_size is None:
+        window_size = (-1, -1)
+    fa256 = _welm_fa256()
+    if (
+        fa256 is not None
+        and causal
+        and window_size[0] < 0
+        and q.dtype == torch.bfloat16
+        and q.shape[-1] == 256
+        and vt.shape[-1] == 256
+    ):
+        # Faster hdim-256 tile (128x64, 2 stages) for full-attention layers.
+        o, lse = fa256.varlen_fwd256(
+            q, kt, vt, out, cu_seqlens_q, cu_k, max_seqlen_q, max_seqlen_k,
+            softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+            True, -1, -1, sinks, _WELM_FA256_CFG,
+        )
+        if return_softmax_lse:
+            return o, lse
+        return o
+    res = flash_attn_cuda.varlen_fwd(
+        q, kt, vt, out, cu_seqlens_q, cu_k, None, None, None, None,
+        max_seqlen_q, max_seqlen_k, 0.0,
+        softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+        False, causal, window_size[0], window_size[1], 0.0, False,
+        None, None, None, None, sinks,
+    )
+    if return_softmax_lse:
+        return res[0], res[5]
+    return res[0]
+
+
+_WELM_FA256_CFG = int(os.environ.get("SGLANG_WELM_FA256_CFG", "4"))
+_welm_fa256_mod = None
+
+
+def _welm_fa256():
+    """Standalone hdim-256 bf16 forward (welm_fa256.so); None when disabled/unavailable.
+    SGLANG_WELM_FA256_CFG: 4 = 128x64 tile (fast), 1 = 64x32 (bit-exact with vendor), 0 = off."""
+    global _welm_fa256_mod
+    if _welm_fa256_mod is None:
+        _welm_fa256_mod = False
+        if _WELM_FA256_CFG in (1, 4):
+            try:
+                from sglang.srt.layers.attention import welm_fa256
+
+                _welm_fa256_mod = welm_fa256
+            except ImportError as e:
+                logger.warning(f"welm_fa256 unavailable, using vendor kernel: {e}")
+    return _welm_fa256_mod or None
+
+
+def _can_use_hcu_prefill_no_sync(q, k, v, max_seqlen_q, block_table, seqused_k,
+                                 total_k_hint, layout, q_descale, k_descale, v_descale):
+    return (
+        _is_hcu
+        and not _use_triton_vllm_fa
+        and _HCU_PREFILL_NO_SYNC
+        and isinstance(total_k_hint, int)
+        and total_k_hint > 0
+        and layout == "legacy_bhsd"
+        and block_table is not None
+        and seqused_k is not None
+        and max_seqlen_q >= 16
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and k.dim() == 4
+        and k.shape[-2] == 64
+        and q.shape[-1] == v.shape[-2]
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+    )
+
+
+_HCU_PREFILL_NO_SYNC = get_bool_env_var("SGLANG_HCU_PREFILL_NO_SYNC", default="true")
+
+
 def vllm_flash_attn_varlen_func(
     q,
     k,
@@ -498,6 +617,8 @@ def vllm_flash_attn_varlen_func(
     total_k_hint: Optional[int] = None,
     sinks=None,
 ):
+    if WELM_Q_PRESCALED and softmax_scale is not None:
+        softmax_scale = q.shape[-1] ** -0.5
     # Prefill already has an exact host KV-length sum. The vendor paged
     # prefill wrapper recomputes seqused_k.sum() and branches on that device
     # scalar for every layer, serializing all preceding GPU work. For the
@@ -775,6 +896,44 @@ def vllm_flash_attn_varlen_func(
     # per-head attention sinks. ``max_seqlen_q`` is only an upper bound for
     # the varlen kernel, so raising it routes these batches to the regular
     # paged-prefill kernel, which applies sinks correctly.
+    # Short uniform queries (target verify, draft extend): run each query
+    # token as its own single-token decode row against the same page-table
+    # row with cache length prefix + i + 1. This is exact bottom-right causal
+    # attention, supports sinks and windows, and avoids the slow
+    # paged->contiguous KV conversion of the varlen path (~8x faster here).
+    if (
+        _is_hcu
+        and causal
+        and layout == "legacy_bhsd"
+        and 1 < max_seqlen_q <= _HCU_SHORT_Q_AS_DECODE_MAX
+        and block_table is not None
+        and seqused_k is not None
+        and q.shape[0] == (cu_seqlens_q.shape[0] - 1) * max_seqlen_q
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == q.dtype
+    ):
+        n = max_seqlen_q
+        bs = cu_seqlens_q.shape[0] - 1
+        from sglang.srt.layers.welmv4_fast_op import short_q_expand
+
+        # Graph-padding rows may be shorter than n; keep them >= 1.
+        row_lens, row_page_table = short_q_expand(seqused_k, block_table, n)
+        result = vllm_flash_attn_with_kvcache(
+            q=q.view(bs * n, 1, q.shape[1], q.shape[2]),
+            k_cache=k,
+            v_cache=v,
+            page_table=row_page_table,
+            cache_seqlens=row_lens,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+            sinks=sinks,
+        ).view(q.shape[0], q.shape[1], v.shape[2])
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
     if _is_hcu and sinks is not None and 1 < max_seqlen_q < 16:
         max_seqlen_q = 16
     # Below 16 query tokens the vendor varlen interface dispatches to the
@@ -792,28 +951,47 @@ def vllm_flash_attn_varlen_func(
         and window_size is not None
         and window_size[0] >= 0
     ):
-        result, lse = vllm_flash_attn_varlen_func_interface(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            block_table=block_table,
-            fa_version=fa_version,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            return_softmax_lse=True,
-        )[:2]
+        if _can_use_hcu_prefill_no_sync(
+            q, k, v, max_seqlen_q, block_table, seqused_k, total_k_hint,
+            layout, q_descale, k_descale, v_descale,
+        ):
+            result, lse = _hcu_paged_prefill_no_sync(
+                q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
+                softmax_scale, causal, window_size, block_table, total_k_hint,
+                None, return_softmax_lse=True,
+            )
+        else:
+            result, lse = vllm_flash_attn_varlen_func_interface(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_table,
+                fa_version=fa_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                return_softmax_lse=True,
+            )[:2]
         # lse: [num_heads, total_q] -> [total_q, num_heads, 1]
         scale = torch.sigmoid(lse.t().float() - sinks.float()[None, :])
         return (result.float() * scale.unsqueeze(-1)).to(result.dtype)
 
+    if _can_use_hcu_prefill_no_sync(
+        q, k, v, max_seqlen_q, block_table, seqused_k, total_k_hint,
+        layout, q_descale, k_descale, v_descale,
+    ):
+        return _hcu_paged_prefill_no_sync(
+            q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
+            softmax_scale, causal, window_size, block_table, total_k_hint,
+            sinks,
+        )
     # Capture may leave the host bound at zero; live lengths remain on GPU.
     return vllm_flash_attn_varlen_func_interface(
         q=q,
