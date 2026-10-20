@@ -199,13 +199,17 @@ def _welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata):
 _WELM_DEDUP_DECODE = __import__("os").environ.get("WELM_DEDUP_DECODE", "true").lower() in ("1", "true")
 _WELM_DEDUP_MIN_BS = int(__import__("os").environ.get("WELM_DEDUP_MIN_BS", "4"))
 _WELM_DEDUP_FIRST_LAYER = None
+_WELM_DEDUP_MIXED = __import__("os").environ.get("WELM_DEDUP_MIXED", "true").lower() in ("1", "true")
 
 
 def _welm_dedup_decode_state(
-    forward_batch, q, key_cache, page_table, cache_seqlens, layer, window_size, excluded
+    forward_batch, q, key_cache, page_table, cache_seqlens, layer, window_size, excluded,
+    mixed=False,
 ):
     """Shared-prefix grouping for full-attention decode rows (once per forward)."""
-    if not _WELM_DEDUP_DECODE or excluded or not forward_batch.forward_mode.is_decode():
+    if not _WELM_DEDUP_DECODE or excluded:
+        return None
+    if not (forward_batch.forward_mode.is_decode() or mixed):
         return None
     if window_size is not None and tuple(window_size) != (-1, -1):
         return None
@@ -1366,6 +1370,25 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if pre.data_ptr() != out.data_ptr():
                 out[:t_pre].copy_(pre.view(t_pre, H, layer.v_head_dim))
+        dedup = None
+        if _WELM_DEDUP_MIXED:
+            from sglang.srt.layers.attention import flashattention_interface as _fi
+
+            # The paged kernel prescale (WELM_Q_PRESCALED) does not apply to
+            # extend batches; the dedup kernel needs the default scale.
+            if abs(layer.scaling - layer.head_dim**-0.5) < 1e-7:
+                dedup = _welm_dedup_decode_state(
+                    forward_batch, q2[t_pre:], key_cache, page_table[n_pre:],
+                    cache_seqlens[n_pre:], layer, window_size, False, mixed=True,
+                )
+        if dedup is not None:
+            from sglang.srt.layers.attention import welm_dedup_decode
+
+            welm_dedup_decode.attend(
+                q2[t_pre:], key_cache, value_cache, cache_seqlens[n_pre:], dedup,
+                sinks=sinks, out=out[t_pre:],
+            )
+            return out
         dec = vllm_flash_attn_with_kvcache(
             q=q2[t_pre:].unsqueeze(1),
             k_cache=key_cache,
