@@ -196,6 +196,53 @@ def _welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata):
     return lens
 
 
+_WELM_DEDUP_DECODE = __import__("os").environ.get("WELM_DEDUP_DECODE", "true").lower() in ("1", "true")
+_WELM_DEDUP_MIN_BS = int(__import__("os").environ.get("WELM_DEDUP_MIN_BS", "4"))
+_WELM_DEDUP_FIRST_LAYER = None
+
+
+def _welm_dedup_decode_state(
+    forward_batch, q, key_cache, page_table, cache_seqlens, layer, window_size, excluded
+):
+    """Shared-prefix grouping for full-attention decode rows (once per forward)."""
+    if not _WELM_DEDUP_DECODE or excluded or not forward_batch.forward_mode.is_decode():
+        return None
+    if window_size is not None and tuple(window_size) != (-1, -1):
+        return None
+    from sglang.srt.layers.attention import flashattention_interface as _fi
+    from sglang.srt.layers.attention import welm_dedup_decode as _dd
+
+    B = q.shape[0]
+    if not (_WELM_DEDUP_MIN_BS <= B <= _dd.MAX_B) or B != page_table.shape[0]:
+        return None
+    if (
+        q.dtype != torch.bfloat16
+        or q.shape[1] != 6
+        or q.shape[2] != 256
+        or key_cache.dim() != 4
+        or key_cache.shape[1] != 1
+        or key_cache.shape[2] != 64
+        or key_cache.dtype != torch.bfloat16
+    ):
+        return None
+    if not (_fi.WELM_Q_PRESCALED or abs(layer.scaling - 256**-0.5) < 1e-7):
+        return None
+    if not _dd.available():
+        return None
+    # Group once per forward, at the first full-attention layer: layers run
+    # in order, so the grouping kernels are also captured into decode graphs
+    # (a cache keyed on Python objects would survive capture warmup).
+    global _WELM_DEDUP_FIRST_LAYER
+    lid = layer.layer_id
+    if _WELM_DEDUP_FIRST_LAYER is None or lid <= _WELM_DEDUP_FIRST_LAYER:
+        _WELM_DEDUP_FIRST_LAYER = lid
+        return _dd.prepare(
+            page_table, cache_seqlens, page_table.shape[1] * key_cache.shape[2],
+            key_cache.shape[2], B,
+        )
+    return _dd.get_prepared(page_table.shape[1] * key_cache.shape[2], key_cache.shape[2], B, q.device)
+
+
 def _hcu_mixed_decode_rows(forward_batch) -> int:
     """Trailing one-token segments of a mixed batch (the decode rows).
 
@@ -2374,6 +2421,19 @@ class FlashAttentionBackend(AttentionBackend):
                     q_dec, _sp_padded_rows = _trim_padded_q_for_batch_api(
                         q_reshaped, page_table
                     )
+                    dedup = _welm_dedup_decode_state(
+                        forward_batch, q_dec, key_cache, page_table, cache_seqlens,
+                        layer, window_size, use_cascade_attn or pa_swa_active,
+                    )
+                if self._use_hcu_legacy_layout and dedup is not None:
+                    from sglang.srt.layers.attention import welm_dedup_decode
+
+                    result = welm_dedup_decode.attend(
+                        q_dec, key_cache, value_cache, cache_seqlens, dedup,
+                        sinks=kwargs.get("sinks"),
+                    ).unsqueeze(1)
+                    result = _restore_padded_q_rows(result, _sp_padded_rows)
+                elif self._use_hcu_legacy_layout:
                     result = vllm_flash_attn_with_kvcache(
                         q=q_dec.unsqueeze(1),
                         k_cache=key_cache,
