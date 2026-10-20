@@ -1021,3 +1021,53 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
         WINDOW_LEFT=window_left, num_warps=4,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Paged KV (HCU legacy layout K [pages, KVH, P, D], V [pages, KVH, D, P]) ->
+# contiguous K/V [tokens, KVH, D] packed per request at cu_k offsets. Same
+# result as flash_attn_cuda.pagedkv_to_contiguouskv, which has a ~100 us
+# floor per call (0.1-0.25 TB/s) at prefill sizes.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _welm_pagedkv_to_contig_kernel(
+    K, V, KT, VT, BT, SEQK, CUK,
+    stride_kb, stride_kh, stride_kp,
+    stride_vb, stride_vh, stride_vd,
+    stride_bt, stride_kt_t, stride_kt_h, stride_vt_t, stride_vt_h,
+    D: tl.constexpr, PAGE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    p = tl.program_id(1)
+    h = tl.program_id(2)
+    n = tl.load(SEQK + b)
+    t0 = p * PAGE
+    if t0 >= n:
+        return
+    base = tl.load(CUK + b).to(tl.int64)
+    page = tl.load(BT + b * stride_bt + p).to(tl.int64)
+    offs_t = tl.arange(0, PAGE)
+    offs_d = tl.arange(0, D)
+    m = (t0 + offs_t) < n
+    k = tl.load(K + page * stride_kb + h * stride_kh + offs_t[:, None] * stride_kp + offs_d[None, :])
+    tl.store(KT + (base + t0 + offs_t)[:, None] * stride_kt_t + h * stride_kt_h + offs_d[None, :], k, mask=m[:, None])
+    v = tl.load(V + page * stride_vb + h * stride_vh + offs_d[:, None] * stride_vd + offs_t[None, :])  # [D, P]
+    tl.store(VT + (base + t0 + offs_t)[None, :] * stride_vt_t + h * stride_vt_h + offs_d[:, None], v, mask=m[None, :])
+
+
+def welm_pagedkv_to_contiguous(kt, vt, k_cache, v_cache, block_table, seqused_k, cu_k, max_seqlen_k):
+    """Fills kt/vt [>= sum(seqused_k), KVH, D] and cu_k [bs + 1] (int32)."""
+    bs = seqused_k.shape[0]
+    cu_k[:1].zero_()
+    torch.cumsum(seqused_k, 0, out=cu_k[1:])
+    KVH, PAGE, D = k_cache.shape[1], k_cache.shape[2], k_cache.shape[3]
+    max_pages = triton.cdiv(int(max_seqlen_k), PAGE)
+    if bs == 0 or max_pages == 0:
+        return
+    _welm_pagedkv_to_contig_kernel[(bs, max_pages, KVH)](
+        k_cache, v_cache, kt, vt, block_table, seqused_k, cu_k,
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        block_table.stride(0), kt.stride(0), kt.stride(1), vt.stride(0), vt.stride(1),
+        D=D, PAGE=PAGE, num_warps=4,
+    )

@@ -593,9 +593,24 @@ def _hcu_paged_prefill_no_sync(
     kt = torch.empty((workspace_tokens, nheads_kv, q.shape[-1]), device=q.device, dtype=k.dtype)
     vt = torch.empty((workspace_tokens, nheads_kv, v.shape[-2]), device=q.device, dtype=v.dtype)
     cu_k = torch.empty_like(cu_seqlens_q)
-    flash_attn_cuda.pagedkv_to_contiguouskv(
-        kt, vt, k, v, block_table, seqused_k, cu_k, max_seqlen_k, 0
-    )
+    if (
+        _WELM_FAST_P2C
+        and k.dtype == torch.bfloat16
+        and k.dim() == 4
+        and v.dim() == 4
+        and tuple(v.shape[2:]) == (k.shape[3], k.shape[2])
+        and cu_k.dtype == torch.int32
+        and seqused_k.dtype == torch.int32
+    ):
+        from sglang.srt.layers.welmv4_fast_op import welm_pagedkv_to_contiguous
+
+        welm_pagedkv_to_contiguous(
+            kt, vt, k, v, block_table, seqused_k, cu_k, max_seqlen_k
+        )
+    else:
+        flash_attn_cuda.pagedkv_to_contiguouskv(
+            kt, vt, k, v, block_table, seqused_k, cu_k, max_seqlen_k, 0
+        )
     if window_size is None:
         window_size = (-1, -1)
     fa256 = _welm_fa256()
@@ -639,6 +654,8 @@ def _hcu_paged_prefill_no_sync(
 
 
 _WELM_FA256_CFG = int(os.environ.get("SGLANG_WELM_FA256_CFG", "20"))
+# Triton paged->contiguous KV copy (bit-identical, ~4x faster).
+_WELM_FAST_P2C = get_bool_env_var("WELM_FAST_P2C", default="true")
 # Split-KV prefill for short new segments over long cached prefixes.
 _WELM_FA_SPLIT = get_bool_env_var("WELM_FA_SPLIT", default="true")
 _welm_fa256_mod = None
