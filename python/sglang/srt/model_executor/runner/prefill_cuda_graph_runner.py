@@ -1173,14 +1173,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        # WeLM mixed batches fill the n-grams of their decode rows from the
-        # device ring by row count (see welm_spec_n_gram_input_ids), which the
-        # static graph buffers cannot express; run them eagerly.
-        if forward_batch.forward_mode.is_mixed() and getattr(
-            self.model_runner.model_config.hf_config, "model_type", ""
-        ).startswith("welm"):
-            return False
-
         # Non-DP local check (sole decision for tp-only).
         if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,

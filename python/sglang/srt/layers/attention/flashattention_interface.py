@@ -401,6 +401,8 @@ _WELM_PFX_ATTN_MAX_Q = int(os.environ.get("WELM_PFX_ATTN_MAX_Q", "256"))
 
 
 _WELM_DEC_ATTN = get_bool_env_var("WELM_DEC_ATTN", default="true")
+# Verify / draft-extend: use the paged kernel's multi-token (mtp) mode.
+_WELM_PA_MTP = get_bool_env_var("WELM_PA_MTP", default="true")
 # Decode rows use the vendor paged-attention kernel unless it would drop
 # tokens (see _hcu_paged_attention_covers); batch sizes up to this always use
 # welm_decode_attention. In serving it is not faster than the vendor kernel,
@@ -1023,6 +1025,34 @@ def vllm_flash_attn_varlen_func(
     ):
         n = max_seqlen_q
         bs = cu_seqlens_q.shape[0] - 1
+        if (
+            _WELM_PA_MTP
+            and q.dtype == torch.bfloat16
+            and k.dim() == 4
+            and q.shape[1] * n <= k.shape[1] * 64
+            and _hcu_paged_attention_covers(
+                k.shape[0], k.shape[2], bs, block_table.shape[1] * k.shape[2]
+            )
+        ):
+            # The paged kernel's multi-token mode reads each row's KV once for
+            # all n queries (bottom-right causal, per-folded-head sinks); the
+            # expansion below reads it n times.
+            result = vllm_flash_attn_with_kvcache(
+                q=q.view(bs, n, q.shape[1], q.shape[2]),
+                k_cache=k,
+                v_cache=v,
+                page_table=block_table,
+                # graph-padding rows may be shorter than n
+                cache_seqlens=torch.clamp(seqused_k, min=n),
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+                sinks=sinks.repeat(n) if sinks is not None else None,
+            ).view(q.shape[0], q.shape[1], v.shape[2])
+            if out is not None:
+                out.copy_(result)
+                return out
+            return result
         from sglang.srt.layers.welmv4_fast_op import short_q_expand
 
         # Graph-padding rows may be shorter than n; keep them >= 1.

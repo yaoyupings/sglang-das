@@ -528,20 +528,19 @@ def welm_spec_n_gram_input_ids(
         # Masked-out writes go to the reserved padding row 0 instead of being
         # filtered with a boolean index, which would need a host sync and
         # break prefill CUDA graph capture.
-        if not is_draft and mode.is_mixed():
-            # Mixed chunked prefill: the scheduler grams cover only the
-            # prefill tokens; the trailing decode rows (one token each) read
-            # their predecessors from the ring like a plain decode step.
-            n_dec = num_tokens - current.input_ids_grams[0].shape[0]
-            if n_dec > 0:
-                dec = slice(num_tokens - n_dec, num_tokens)
-                dec_grams = _welm_read_ring(ring, rows[dec], tpos[dec])
-                current = NGramInputIds(
-                    input_ids_grams=[
-                        torch.cat([g.to(torch.int64), dg])
-                        for g, dg in zip(current.input_ids_grams, dec_grams)
-                    ]
-                )
+        if (
+            not is_draft
+            and current is not None
+            and len(current.input_ids_grams) > 0
+            and current.input_ids_grams[0].shape[0] == num_tokens
+        ):
+            # Mixed batches mark decode rows' grams with -1: their
+            # predecessors come from the ring, like a plain decode step.
+            # In place: callers (and prefill-graph capture) keep these
+            # tensors as the batch's n-gram buffers.
+            ring_grams = _welm_read_ring(ring, rows, tpos)
+            for g, rg in zip(current.input_ids_grams, ring_grams):
+                g.copy_(torch.where(g < 0, rg.to(g.dtype), g))
         tail = valid & (idx >= lens - slots)
         ring[torch.where(tail, rows, 0), torch.remainder(tpos, slots)] = ids
         if not is_draft:

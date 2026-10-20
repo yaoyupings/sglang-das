@@ -170,6 +170,9 @@ class FlashAttentionMetadata:
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
+_WELM_PFX_ATTN_MAX_Q_BACKEND = int(__import__("os").environ.get("WELM_PFX_ATTN_MAX_Q", "256"))
+
+
 def _welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata):
     """Host (query, kv) lengths per request for the split-KV prefill.
 
@@ -1282,6 +1285,12 @@ class FlashAttentionBackend(AttentionBackend):
             )
         if n_pre > 0:
             seq_lens_cpu = forward_batch.seq_lens_cpu
+            host = None
+            if seq_lens_cpu is not None and forward_batch.extend_seq_lens_cpu is not None:
+                host = (
+                    [int(x) for x in forward_batch.extend_seq_lens_cpu[:n_pre]],
+                    [int(x) for x in seq_lens_cpu[:n_pre].tolist()],
+                )
             pre = vllm_flash_attn_varlen_func(
                 q=q2[:t_pre],
                 k=key_cache,
@@ -1303,6 +1312,7 @@ class FlashAttentionBackend(AttentionBackend):
                 layout="legacy_bhsd",
                 sinks=sinks,
                 out=out[:t_pre],
+                host_seq_lens=host,
                 total_k_hint=(
                     int(seq_lens_cpu[:n_pre].sum()) if seq_lens_cpu is not None else None
                 ),
@@ -1695,7 +1705,14 @@ class FlashAttentionBackend(AttentionBackend):
             elif (
                 self._use_hcu_legacy_layout
                 and max_seqlen_q > 1
-                and forward_batch.forward_mode.is_mixed()
+                and (
+                    forward_batch.forward_mode.is_mixed()
+                    or forward_batch.forward_mode == ForwardMode.EXTEND
+                )
+                and cu_seqlens_q is metadata.cu_seqlens_q
+                # 8 < q <= 256: the split-KV prefix kernel already serves the
+                # one-token rows efficiently.
+                and not (8 < max_seqlen_q <= _WELM_PFX_ATTN_MAX_Q_BACKEND)
                 and not use_cascade_attn
                 and not use_local_attn
                 and not layer.is_cross_attention

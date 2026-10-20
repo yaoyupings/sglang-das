@@ -2892,8 +2892,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mix_running_indices = running_batch.req_pool_indices
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
+        prefill_grams = self.n_gram_input_ids
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if prefill_grams is not None and len(prefill_grams) > 0:
+            # WeLM OE n-grams: the decode rows' predecessors live in the
+            # device ring (see welm_spec_n_gram_input_ids); -1 asks the model
+            # to read them there. Keeps the grams one row per token, so mixed
+            # batches also fit the static prefill-graph buffers.
+            pad = prefill_grams.input_ids_grams[0].new_full((running_bs,), -1)
+            self.n_gram_input_ids = NGramInputIds(
+                input_ids_grams=[
+                    torch.cat([g, pad]) for g in prefill_grams.input_ids_grams
+                ]
+            )
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
