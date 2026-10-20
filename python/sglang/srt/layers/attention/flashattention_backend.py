@@ -170,6 +170,48 @@ class FlashAttentionMetadata:
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
+def _welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata):
+    """Host (query, kv) lengths per request for the split-KV prefill.
+
+    Only for plain extend batches whose query layout is the regular
+    per-request one (not the mirror / SWA-spec / local-attention variants).
+    """
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or cu_seqlens_q is not metadata.cu_seqlens_q
+        or forward_batch.extend_seq_lens_cpu is None
+        or forward_batch.seq_lens_cpu is None
+    ):
+        return None
+    lens = getattr(forward_batch, "_welm_host_seq_lens", None)
+    if lens is None:
+        lens = (
+            [int(x) for x in forward_batch.extend_seq_lens_cpu],
+            [int(x) for x in forward_batch.seq_lens_cpu.tolist()],
+        )
+        forward_batch._welm_host_seq_lens = lens
+    return lens
+
+
+def _hcu_mixed_decode_rows(forward_batch) -> int:
+    """Trailing one-token segments of a mixed batch (the decode rows).
+
+    A one-token prefill segment adjacent to them is counted too; attending a
+    single query to its full context is the same computation either way.
+    """
+    n = getattr(forward_batch, "_hcu_mixed_decode_rows", None)
+    if n is None:
+        n = 0
+        lens = forward_batch.extend_seq_lens_cpu
+        if lens is not None:
+            for length in reversed(list(lens)):
+                if int(length) != 1:
+                    break
+                n += 1
+        forward_batch._hcu_mixed_decode_rows = n
+    return n
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -1215,6 +1257,73 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _hcu_mixed_extend_attention(
+        self, q, key_cache, value_cache, page_table, cu_seqlens_q,
+        cache_seqlens, max_seqlen_q, metadata, layer, window_size, sinks,
+        forward_batch, out,
+    ):
+        """Mixed chunked prefill on the HCU legacy layout.
+
+        The varlen prefill path copies every row's paged KV into a contiguous
+        buffer, so the decode rows riding along (one query each, full context)
+        would cost a copy of their whole KV per layer. Run the prefill
+        segments through the varlen path and the trailing decode rows through
+        the paged decode kernel instead.
+        """
+        n_dec = _hcu_mixed_decode_rows(forward_batch)
+        bs = cache_seqlens.shape[0]
+        n_pre = bs - n_dec
+        H, D = layer.tp_q_head_num, layer.head_dim
+        q2 = q.contiguous().view(-1, H, D)
+        t_pre = q2.shape[0] - n_dec
+        if out is None:
+            out = torch.empty(
+                (q2.shape[0], H, layer.v_head_dim), dtype=q2.dtype, device=q2.device
+            )
+        if n_pre > 0:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            pre = vllm_flash_attn_varlen_func(
+                q=q2[:t_pre],
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=cu_seqlens_q[: n_pre + 1],
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=cache_seqlens[:n_pre],
+                max_seqlen_k=(
+                    metadata.max_seq_len_k or page_table.shape[1] * self.page_size
+                ),
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                block_table=page_table[:n_pre],
+                fa_version=2,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                layout="legacy_bhsd",
+                sinks=sinks,
+                out=out[:t_pre],
+                total_k_hint=(
+                    int(seq_lens_cpu[:n_pre].sum()) if seq_lens_cpu is not None else None
+                ),
+            )
+            if pre.data_ptr() != out.data_ptr():
+                out[:t_pre].copy_(pre.view(t_pre, H, layer.v_head_dim))
+        dec = vllm_flash_attn_with_kvcache(
+            q=q2[t_pre:].unsqueeze(1),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table[n_pre:],
+            cache_seqlens=cache_seqlens[n_pre:],
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            sinks=sinks,
+        )
+        out[t_pre:].copy_(dec.view(n_dec, H, layer.v_head_dim))
+        return out
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1583,6 +1692,21 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif (
+                self._use_hcu_legacy_layout
+                and max_seqlen_q > 1
+                and forward_batch.forward_mode.is_mixed()
+                and not use_cascade_attn
+                and not use_local_attn
+                and not layer.is_cross_attention
+                and self.kv_cache_dtype_str == "auto"
+                and _hcu_mixed_decode_rows(forward_batch) > 0
+            ):
+                result = self._hcu_mixed_extend_attention(
+                    q, key_cache, value_cache, page_table, cu_seqlens_q,
+                    cache_seqlens, max_seqlen_q, metadata, layer, window_size,
+                    kwargs.get("sinks"), forward_batch, _fa_out,
+                )
             elif self._use_hcu_legacy_layout and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1624,6 +1748,7 @@ class FlashAttentionBackend(AttentionBackend):
                     layout="legacy_bhsd",
                     sinks=kwargs.get("sinks"),
                     out=_fa_out,
+                    host_seq_lens=_welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata),
                     total_k_hint=(
                         forward_batch.seq_lens_sum
                         if _is_hcu

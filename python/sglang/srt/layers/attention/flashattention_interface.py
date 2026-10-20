@@ -558,7 +558,7 @@ def flash_attn_varlen_func(
 def _hcu_paged_prefill_no_sync(
     q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
     softmax_scale, causal, window_size, block_table, total_k, sinks,
-    return_softmax_lse=False, out=None,
+    return_softmax_lse=False, out=None, host_seq_lens=None,
 ):
     """The vendor paged-prefill path (paged -> contiguous KV, then varlen_fwd)
     with the workspace sized from a host-side KV total.
@@ -589,6 +589,16 @@ def _hcu_paged_prefill_no_sync(
         and vt.shape[-1] == 256
     ):
         # Faster hdim-256 tile (128x64, 2 stages) for full-attention layers.
+        if host_seq_lens is not None and not return_softmax_lse and _WELM_FA_SPLIT:
+            from sglang.srt.layers.attention import welm_fa_split
+
+            q_lens, k_lens = host_seq_lens
+            if welm_fa_split.should_split(q_lens, k_lens):
+                return welm_fa_split.fa256_split_prefill(
+                    fa256, q, kt, vt, q_lens, k_lens,
+                    softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+                    sinks, _WELM_FA256_CFG, out=out,
+                )
         o, lse = fa256.varlen_fwd256(
             q, kt, vt, out, cu_seqlens_q, cu_k, max_seqlen_q, max_seqlen_k,
             softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
@@ -610,6 +620,8 @@ def _hcu_paged_prefill_no_sync(
 
 
 _WELM_FA256_CFG = int(os.environ.get("SGLANG_WELM_FA256_CFG", "4"))
+# Split-KV prefill for short new segments over long cached prefixes.
+_WELM_FA_SPLIT = get_bool_env_var("WELM_FA_SPLIT", default="true")
 _welm_fa256_mod = None
 
 
@@ -676,6 +688,7 @@ def vllm_flash_attn_varlen_func(
     out=None,
     total_k_hint: Optional[int] = None,
     sinks=None,
+    host_seq_lens=None,
 ):
     if WELM_Q_PRESCALED and softmax_scale is not None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1086,7 +1099,7 @@ def vllm_flash_attn_varlen_func(
         return _hcu_paged_prefill_no_sync(
             q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
             softmax_scale, causal, window_size, block_table, total_k_hint,
-            sinks,
+            sinks, out=out, host_seq_lens=host_seq_lens,
         )
     # Capture may leave the host bound at zero; live lengths remain on GPU.
     return vllm_flash_attn_varlen_func_interface(

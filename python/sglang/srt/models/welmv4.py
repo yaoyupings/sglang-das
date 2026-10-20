@@ -96,6 +96,33 @@ WELM_KV_MIRROR_PP_KEY_PREFIX = "welm_kv_mirror"
 WELM_KV_MIRROR_STATES_KEY = "welm_kv_mirror_states"
 _WELM_FAST_ROUTER = get_bool_env_var("WELM_FAST_ROUTER", "true")
 _WELM_FAST_QK = get_bool_env_var("WELM_FAST_QK", "true")
+# Decode: write k/v into the paged KV cache from the qk-norm/rope kernel.
+_WELM_FUSED_KV_STORE = get_bool_env_var("WELM_FUSED_KV_STORE", "true")
+
+
+def _welm_fused_kv_store_buffers(forward_batch, layer_id, dtype):
+    """(k_cache, v_cache) of the HCU legacy-layout pool for a direct decode
+    write, or None when the pool uses any other layout / dtype."""
+    from sglang.srt.mem_cache import memory_pool as _mp
+
+    pool = getattr(getattr(forward_batch, "attn_backend", None), "token_to_kv_pool", None)
+    if (
+        pool is None
+        or not _mp._kv_layout_hcu_fa
+        or getattr(pool, "use_hnd", True)
+        or not hasattr(pool, "k_buffer")
+        or getattr(pool, "dtype", None) != dtype
+        or getattr(pool, "store_dtype", None) != dtype
+        or getattr(pool, "start_layer", None) is None
+    ):
+        return None
+    idx = layer_id - pool.start_layer
+    if not 0 <= idx < len(pool.k_buffer):
+        return None
+    k_buf, v_buf = pool.k_buffer[idx], pool.v_buffer[idx]
+    if k_buf.dim() != 4 or v_buf.dim() != 4:
+        return None
+    return k_buf, v_buf
 # Run the shared expert as an extra (always selected, weight 1) expert inside
 # the routed fused MoE instead of three separate GEMM/activation kernels.
 _WELM_FUSE_SHARED_EXPERT = get_bool_env_var("WELM_FUSE_SHARED_EXPERT", "true")
@@ -501,6 +528,20 @@ def welm_spec_n_gram_input_ids(
         # Masked-out writes go to the reserved padding row 0 instead of being
         # filtered with a boolean index, which would need a host sync and
         # break prefill CUDA graph capture.
+        if not is_draft and mode.is_mixed():
+            # Mixed chunked prefill: the scheduler grams cover only the
+            # prefill tokens; the trailing decode rows (one token each) read
+            # their predecessors from the ring like a plain decode step.
+            n_dec = num_tokens - current.input_ids_grams[0].shape[0]
+            if n_dec > 0:
+                dec = slice(num_tokens - n_dec, num_tokens)
+                dec_grams = _welm_read_ring(ring, rows[dec], tpos[dec])
+                current = NGramInputIds(
+                    input_ids_grams=[
+                        torch.cat([g.to(torch.int64), dg])
+                        for g, dg in zip(current.input_ids_grams, dec_grams)
+                    ]
+                )
         tail = valid & (idx >= lens - slots)
         ring[torch.where(tail, rows, 0), torch.remainder(tpos, slots)] = ids
         if not is_draft:
@@ -1716,6 +1757,7 @@ class Qwen2MoeAttention(nn.Module):
             )
         )
         q_prescaled = False
+        attn_kwargs_save = True
         if use_fast_qk:
             # The HCU paged-attention path used for decode / target verify
             # rescales q by softmax_scale / default_scale; fold that into the
@@ -1724,6 +1766,20 @@ class Qwen2MoeAttention(nn.Module):
             q_ratio = (
                 self.scaling / (self.head_dim**-0.5) if q_prescaled else 1.0
             )
+            kv_store = None
+            if (
+                _WELM_FUSED_KV_STORE
+                and mode.is_decode()
+                and v.dim() == 2
+                and v.stride(-1) == 1
+                and forward_batch.out_cache_loc is not None
+                and forward_batch.out_cache_loc.shape[0] == k.shape[0]
+            ):
+                bufs = _welm_fused_kv_store_buffers(
+                    forward_batch, self.attn.layer_id, k.dtype
+                )
+                if bufs is not None and bufs[0].shape[1] == k.shape[1] // self.head_dim:
+                    kv_store = (v, bufs[0], bufs[1], forward_batch.out_cache_loc)
             k, q = welm_qk_norm_rope(
                 q,
                 k,
@@ -1737,7 +1793,10 @@ class Qwen2MoeAttention(nn.Module):
                 # q is a strided view of the fused projection output; a
                 # contiguous q here saves the attention backend a copy kernel.
                 return_q=True,
+                kv_store=kv_store,
             )
+            if kv_store is not None:
+                attn_kwargs_save = False
             q_prescaled = q_prescaled and q_ratio != 1.0
         else:
             q, k = self._qk_norm_rope_ref(
@@ -1759,6 +1818,8 @@ class Qwen2MoeAttention(nn.Module):
                     start = self.attn_tp_rank * local_num_heads
                     attn_sink = attn_sink.narrow(0, start, local_num_heads)
             attn_kwargs["sinks"] = attn_sink
+        if not attn_kwargs_save:
+            attn_kwargs["save_kv_cache"] = False
         if q_prescaled:
             _fa_iface.WELM_Q_PRESCALED = True
             try:

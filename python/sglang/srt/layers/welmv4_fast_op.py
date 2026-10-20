@@ -104,14 +104,27 @@ def _welm_router_topk_kernel(
     low = ((N - 1 - tie_rank) * N + offs).to(tl.int64)
     key = (ordered << 32) | low
     neg: tl.constexpr = -9223372036854775807 - 1
+    # Select ids first; gather their weights (sigmoid of the summed partial
+    # logits, recomputed for the TOPK ids only) after the loop.
+    KPAD: tl.constexpr = 16 if TOPK <= 16 else 32
+    kk = tl.arange(0, KPAD)
+    ids = tl.zeros((KPAD,), dtype=tl.int32)
     for k in tl.static_range(TOPK):
         best = tl.max(key, axis=0)
         idx = (best & (N - 1)).to(tl.int32)
-        sel = offs == idx
-        w = tl.sum(tl.where(sel, scores, 0.0), axis=0)
-        tl.store(topk_weights_ptr + row * OUT_K + k, w)
-        tl.store(topk_ids_ptr + row * OUT_K + k, idx.to(topk_ids_ptr.dtype.element_ty))
-        key = tl.where(sel, neg, key)
+        ids = tl.where(kk == k, idx, ids)
+        key = tl.where(offs == idx, neg, key)
+    lg = tl.zeros((KPAD,), dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        lg += tl.load(part_ptr + (s * M + row).to(tl.int64) * N + ids)
+    w = 1.0 / (1.0 + tl.exp(-lg))
+    w = tl.where(w == w, w, -float("inf"))
+    m = kk < TOPK
+    tl.store(topk_weights_ptr + row * OUT_K + kk, w, mask=m)
+    tl.store(topk_ids_ptr + row * OUT_K + kk, ids.to(topk_ids_ptr.dtype.element_ty), mask=m)
+
+
+_WELM_ROUTER_BLAS_MIN_M = int(__import__("os").environ.get("WELM_ROUTER_BLAS_MIN_M", "1000000000"))
 
 
 def welm_fast_router_topk(
@@ -142,22 +155,30 @@ def welm_fast_router_topk(
         BLOCK_M, BLOCK_N, BLOCK_K, split_k, nw = 64, 128, 64, 1, 2
     split_k = min(split_k, K // BLOCK_K)
     assert K % (split_k * BLOCK_K) == 0
-    part = torch.empty((split_k, M, N), dtype=torch.float32, device=x.device)
-    grid = (N // BLOCK_N, split_k, triton.cdiv(M, BLOCK_M))
-    _welm_router_splitk_kernel[grid](
-        x,
-        weight_bf16,
-        part,
-        M,
-        N,
-        K,
-        x.stride(0),
-        SPLIT_K=split_k,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=nw,
-    )
+    if M >= _WELM_ROUTER_BLAS_MIN_M and x.stride(1) == 1:
+        # Large prefill: hipBLASLt bf16 GEMM with fp32 output is ~3x faster
+        # than the Triton split-K tiles here.
+        split_k = 1
+        part = torch.mm(x, weight_bf16.t(), out_dtype=torch.float32).unsqueeze(0)
+    else:
+        part = None
+    if part is None:
+        part = torch.empty((split_k, M, N), dtype=torch.float32, device=x.device)
+        grid = (N // BLOCK_N, split_k, triton.cdiv(M, BLOCK_M))
+        _welm_router_splitk_kernel[grid](
+            x,
+            weight_bf16,
+            part,
+            M,
+            N,
+            K,
+            x.stride(0),
+            SPLIT_K=split_k,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=nw,
+        )
     out_k = topk + (1 if shared_expert_id >= 0 else 0)
     topk_weights = torch.empty((M, out_k), dtype=torch.float32, device=x.device)
     topk_ids = torch.empty((M, out_k), dtype=torch.int64, device=x.device)
@@ -216,6 +237,13 @@ def _welm_qk_norm_rope_kernel(
     SCALE_Q: tl.constexpr,
     q_out_ptr=None,
     Q_OUT: tl.constexpr = False,
+    v_ptr=None,
+    v_stride=0,
+    kc_ptr=None,
+    vc_ptr=None,
+    loc_ptr=None,
+    PAGE: tl.constexpr = 1,
+    STORE_KV: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     HALF: tl.constexpr = ROPE_DIM // 2
@@ -243,9 +271,20 @@ def _welm_qk_norm_rope_kernel(
         kx = (kx * inv[:, None] * g[None, :]).to(out_ty).to(tl.float32)
         k1 = (k1 * inv[:, None] * g1[None, :]).to(out_ty).to(tl.float32)
         k2 = (k2 * inv[:, None] * g2[None, :]).to(out_ty).to(tl.float32)
-    tl.store(obase + d[None, :], kx.to(out_ty), mask=kmask & (d[None, :] < NOPE))
     r1 = k1 * cos[None, :] - k2 * sin[None, :]
     r2 = k1 * sin[None, :] + k2 * cos[None, :]
+    if STORE_KV:
+        # Write k straight into the paged cache (HCU layout K [pages, H, P, D],
+        # V [pages, H, D, P]) instead of a k_out buffer + a separate store.
+        loc = tl.load(loc_ptr + t).to(tl.int64)
+        page = loc // PAGE
+        off = loc % PAGE
+        obase = kc_ptr + ((page * KH + kh[:, None]) * PAGE + off) * HEAD_DIM
+        vsrc = v_ptr + t.to(tl.int64) * v_stride + kh[:, None] * HEAD_DIM + d[None, :]
+        vv = tl.load(vsrc, mask=kmask, other=0.0)
+        vdst = vc_ptr + ((page * KH + kh[:, None]) * HEAD_DIM + d[None, :]) * PAGE + off
+        tl.store(vdst, vv, mask=kmask)
+    tl.store(obase + d[None, :], kx.to(out_ty), mask=kmask & (d[None, :] < NOPE))
     tl.store(obase + NOPE + dh[None, :], r1.to(out_ty), mask=kmask)
     tl.store(obase + NOPE + HALF + dh[None, :], r2.to(out_ty), mask=kmask)
 
@@ -287,15 +326,28 @@ def welm_qk_norm_rope(
     eps: float = 1e-6,
     q_scale: float = 1.0,
     return_q: bool = False,
+    kv_store=None,
 ):
     """q, k: (T, heads*head_dim) row views. Returns k_out (T, kv_heads*head_dim),
     contiguous; q is updated in place, or with ``return_q`` written to a new
-    contiguous buffer and returned as ``(k_out, q_out)``."""
+    contiguous buffer and returned as ``(k_out, q_out)``.
+
+    ``kv_store=(v, k_cache, v_cache, loc)`` writes k and v directly into the
+    HCU paged KV cache (K [pages, H, P, D], V [pages, H, D, P]) at ``loc``;
+    the returned k is then the unmodified input (the cache holds the result).
+    """
     T = q.shape[0]
     qh = q.shape[1] // head_dim
     kh = k.shape[1] // head_dim
     assert q.stride(1) == 1 and k.stride(1) == 1
-    k_out = torch.empty((T, kh * head_dim), dtype=k.dtype, device=k.device)
+    if kv_store is not None:
+        v, k_cache, v_cache, loc = kv_store
+        assert v.stride(1) == 1 and k_cache.shape[1] == kh
+    k_out = (
+        torch.empty((T, kh * head_dim), dtype=k.dtype, device=k.device)
+        if kv_store is None
+        else k
+    )
     q_out = (
         torch.empty((T, qh * head_dim), dtype=q.dtype, device=q.device)
         if return_q
@@ -325,6 +377,13 @@ def welm_qk_norm_rope(
         SCALE_Q=q_scale != 1.0,
         q_out_ptr=q_out,
         Q_OUT=return_q,
+        v_ptr=kv_store[0] if kv_store is not None else None,
+        v_stride=kv_store[0].stride(0) if kv_store is not None else 0,
+        kc_ptr=kv_store[1] if kv_store is not None else None,
+        vc_ptr=kv_store[2] if kv_store is not None else None,
+        loc_ptr=kv_store[3] if kv_store is not None else None,
+        PAGE=kv_store[1].shape[2] if kv_store is not None else 1,
+        STORE_KV=kv_store is not None,
         num_warps=4,
     )
     return (k_out, q_out) if return_q else k_out

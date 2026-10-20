@@ -360,6 +360,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_MIXED_CHUNK_MIN_TOKENS = int(os.environ.get("SGLANG_MIXED_CHUNK_MIN_TOKENS", "0"))
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -4423,6 +4424,9 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Small prefills run as captured prefill graphs; mixing would push
+            # them (and the decode step) onto the eager path.
+            and (new_batch.extend_num_tokens or 0) >= _MIXED_CHUNK_MIN_TOKENS
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
