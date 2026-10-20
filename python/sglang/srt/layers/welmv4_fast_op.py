@@ -880,13 +880,21 @@ def _welm_dec_attn_partial_kernel(
     stride_mo_b, stride_mo_h, stride_mo_s,
     stride_ml_b, stride_ml_h,
     G: tl.constexpr, KVH: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
-    BLOCK_M: tl.constexpr, CHUNK_PAGES: tl.constexpr,
+    BLOCK_M: tl.constexpr, CHUNK_PAGES: tl.constexpr, WINDOW_LEFT: tl.constexpr = -1,
 ):
     pid = tl.program_id(0)
     split = tl.program_id(1)
+    slot = split
     b = pid // KVH
     kvh = pid % KVH
     kv_len = tl.load(SEQK + b)
+    if WINDOW_LEFT >= 0:
+        # Sliding window: keys [kv_len - 1 - WINDOW_LEFT, kv_len). The grid
+        # covers only the window; split 0 is the chunk holding its start.
+        w_lo = tl.maximum(kv_len - 1 - WINDOW_LEFT, 0)
+        split = split + w_lo // (CHUNK_PAGES * PAGE)
+    else:
+        w_lo = 0
     lo = split * (CHUNK_PAGES * PAGE)
     if lo >= kv_len:
         return
@@ -905,19 +913,21 @@ def _welm_dec_attn_partial_kernel(
         page = tl.load(BT + b * stride_bt + start // PAGE).to(tl.int64)
         k = tl.load(K + page * stride_kb + kvh * stride_kh + offs_p[:, None] * stride_kp + offs_d[None, :])
         qk = tl.dot(q, tl.trans(k)) * sm_scale
-        qk = tl.where((start + offs_p)[None, :] < hi, qk, float("-inf"))
+        kpos = start + offs_p
+        qk = tl.where(((kpos < hi) & (kpos >= w_lo))[None, :], qk, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(qk, 1))
-        p = tl.exp(qk - m_new[:, None])
-        alpha = tl.exp(m_i - m_new)
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        p = tl.exp(qk - m_safe[:, None])
+        alpha = tl.exp(m_i - m_safe)
         v = tl.load(V + page * stride_vb + kvh * stride_vh + offs_d[:, None] * stride_vd + offs_p[None, :])
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), tl.trans(v))
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
     o = acc / l_i[:, None]
     lse = m_i + tl.log(l_i)
-    tl.store(MID_O + b * stride_mo_b + head[:, None] * stride_mo_h + split * stride_mo_s + offs_d[None, :],
+    tl.store(MID_O + b * stride_mo_b + head[:, None] * stride_mo_h + slot * stride_mo_s + offs_d[None, :],
              o, mask=m_mask[:, None])
-    tl.store(MID_LSE + b * stride_ml_b + head * stride_ml_h + split, lse, mask=m_mask)
+    tl.store(MID_LSE + b * stride_ml_b + head * stride_ml_h + slot, lse, mask=m_mask)
 
 
 @triton.jit
@@ -927,12 +937,15 @@ def _welm_dec_attn_reduce_kernel(
     stride_ml_b, stride_ml_h,
     stride_ob, stride_oh,
     D: tl.constexpr, PAGE: tl.constexpr, CHUNK_PAGES: tl.constexpr,
-    BLOCK_S: tl.constexpr, HAS_SINK: tl.constexpr,
+    BLOCK_S: tl.constexpr, HAS_SINK: tl.constexpr, WINDOW_LEFT: tl.constexpr = -1,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
     kv_len = tl.load(SEQK + b)
     n = tl.cdiv(kv_len, CHUNK_PAGES * PAGE)
+    s_begin = 0
+    if WINDOW_LEFT >= 0:
+        s_begin = tl.maximum(kv_len - 1 - WINDOW_LEFT, 0) // (CHUNK_PAGES * PAGE)
     offs_s = tl.arange(0, BLOCK_S)
     offs_d = tl.arange(0, D)
     m = tl.full((), float("-inf"), tl.float32)
@@ -942,6 +955,7 @@ def _welm_dec_attn_reduce_kernel(
     if HAS_SINK:
         denom = tl.full((), 1.0, tl.float32)
     acc = tl.zeros([D], dtype=tl.float32)
+    n = n - s_begin  # partials are stored relative to the window's first split
     for s0 in range(0, n, BLOCK_S):
         s = s0 + offs_s
         msk = s < n
@@ -960,7 +974,7 @@ def _welm_dec_attn_reduce_kernel(
 
 def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_scale,
                           max_context_len, sinks=None, out=None, chunk_pages=None,
-                          num_warps=None, num_stages=1, block_s=32):
+                          num_warps=None, num_stages=1, block_s=32, window_left=-1):
     """One query token per row: q [B, H, D] -> out [B, H, D].
 
     k_cache [blocks, KVH, PAGE, D], v_cache [blocks, KVH, D, PAGE] (HCU legacy
@@ -975,11 +989,18 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
     KVH, PAGE = k_cache.shape[1], k_cache.shape[2]
     G = H // KVH
     max_splits = triton.cdiv(max_context_len, chunk_pages * PAGE)
-    mid_o = torch.empty((B, H, max_splits, D), dtype=torch.float32, device=q.device)
-    mid_lse = torch.empty((B, H, max_splits), dtype=torch.float32, device=q.device)
+    # window_left >= 0: the grid spans the window (+1 for alignment); the
+    # partials keep absolute split indices.
+    grid_splits = (
+        min(max_splits, triton.cdiv(window_left + 1, chunk_pages * PAGE) + 1)
+        if window_left >= 0
+        else max_splits
+    )
+    mid_o = torch.empty((B, H, grid_splits, D), dtype=torch.float32, device=q.device)
+    mid_lse = torch.empty((B, H, grid_splits), dtype=torch.float32, device=q.device)
     if out is None:
         out = torch.empty_like(q)
-    _welm_dec_attn_partial_kernel[(B * KVH, max_splits)](
+    _welm_dec_attn_partial_kernel[(B * KVH, grid_splits)](
         q, k_cache, v_cache, block_table, seq_lens, mid_o, mid_lse, softmax_scale,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
@@ -988,7 +1009,8 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         mid_lse.stride(0), mid_lse.stride(1),
         G=G, KVH=KVH, D=D, PAGE=PAGE, BLOCK_M=max(16, triton.next_power_of_2(G)),
-        CHUNK_PAGES=chunk_pages, num_warps=num_warps, num_stages=num_stages,
+        CHUNK_PAGES=chunk_pages, WINDOW_LEFT=window_left,
+        num_warps=num_warps, num_stages=num_stages,
     )
     _welm_dec_attn_reduce_kernel[(B, H)](
         mid_o, mid_lse, seq_lens, sinks if sinks is not None else mid_lse, out,
@@ -996,6 +1018,6 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
         mid_lse.stride(0), mid_lse.stride(1),
         out.stride(0), out.stride(1),
         D=D, PAGE=PAGE, CHUNK_PAGES=chunk_pages, BLOCK_S=block_s, HAS_SINK=sinks is not None,
-        num_warps=4,
+        WINDOW_LEFT=window_left, num_warps=4,
     )
     return out

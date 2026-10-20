@@ -357,6 +357,11 @@ def vllm_flash_attn_with_kvcache(
         from sglang.srt.layers.welmv4_fast_op import welm_decode_attention
 
         B, _, H, D = q.shape
+        window_left = (
+            window_size[0]
+            if window_size is not None and tuple(window_size) != (-1, -1)
+            else -1
+        )
         out = welm_decode_attention(
             q.view(B, H, D),
             k_cache,
@@ -366,6 +371,8 @@ def vllm_flash_attn_with_kvcache(
             softmax_scale if softmax_scale is not None else D**-0.5,
             page_table.shape[1] * k_cache.shape[2],
             sinks=sinks,
+            window_left=window_left,
+            **({"chunk_pages": 1, "num_warps": 2} if window_left >= 0 else {}),
         )
         return out.view(B, 1, H, D)
     if _is_hcu:
@@ -408,6 +415,8 @@ _WELM_PA_MTP = get_bool_env_var("WELM_PA_MTP", default="true")
 # welm_decode_attention. In serving it is not faster than the vendor kernel,
 # so by default it is only the correctness fallback.
 _WELM_DEC_ATTN_MAX_BS = int(os.environ.get("WELM_DEC_ATTN_MAX_BS", "0"))
+# Sliding-window decode rows use welm_decode_attention up to this batch size.
+_WELM_DEC_ATTN_SWA_MAX_BS = int(os.environ.get("WELM_DEC_ATTN_SWA_MAX_BS", "24"))
 
 
 def _hcu_paged_attention_covers(num_blocks, page_size, num_seqs, max_len):
@@ -425,7 +434,12 @@ def _use_welm_decode_attention(
 ):
     if not _WELM_DEC_ATTN or page_table is None or return_softmax_lse or softcap:
         return False
-    if window_size is not None and tuple(window_size) != (-1, -1):
+    windowed = window_size is not None and tuple(window_size) != (-1, -1)
+    if windowed and not (
+        window_size[0] >= 0
+        and window_size[1] in (0, -1)
+        and q.shape[0] <= _WELM_DEC_ATTN_SWA_MAX_BS
+    ):
         return False
     if q.dim() != 4 or q.shape[1] != 1 or q.dtype != torch.bfloat16:
         return False
@@ -436,6 +450,9 @@ def _use_welm_decode_attention(
     if tuple(v_cache.shape[2:]) != (d, page) or q.shape[3] != d:
         return False
     bs = q.shape[0]
+    if windowed:
+        # The vendor kernel runs one workgroup per row for a short window.
+        return True
     if bs <= _WELM_DEC_ATTN_MAX_BS:
         return True
     return not _hcu_paged_attention_covers(

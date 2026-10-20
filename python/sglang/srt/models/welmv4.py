@@ -105,7 +105,12 @@ def _welm_fused_kv_store_buffers(forward_batch, layer_id, dtype):
     write, or None when the pool uses any other layout / dtype."""
     from sglang.srt.mem_cache import memory_pool as _mp
 
-    pool = getattr(getattr(forward_batch, "attn_backend", None), "token_to_kv_pool", None)
+    try:
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
+    except Exception:
+        pool = None
     if (
         pool is None
         or not _mp._kv_layout_hcu_fa
@@ -1769,6 +1774,7 @@ class Qwen2MoeAttention(nn.Module):
             if (
                 _WELM_FUSED_KV_STORE
                 and mode.is_decode()
+                and get_global_server_args().speculative_algorithm is None
                 and v.dim() == 2
                 and v.stride(-1) == 1
                 and forward_batch.out_cache_loc is not None
