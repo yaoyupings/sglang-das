@@ -351,6 +351,23 @@ def vllm_flash_attn_with_kvcache(
             layout=layout,
         )
 
+    if _is_hcu and _use_welm_decode_attention(
+        q, k_cache, v_cache, page_table, window_size, softcap, return_softmax_lse
+    ):
+        from sglang.srt.layers.welmv4_fast_op import welm_decode_attention
+
+        B, _, H, D = q.shape
+        out = welm_decode_attention(
+            q.view(B, H, D),
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            softmax_scale if softmax_scale is not None else D**-0.5,
+            page_table.shape[1] * k_cache.shape[2],
+            sinks=sinks,
+        )
+        return out.view(B, 1, H, D)
     if _is_hcu:
         q, softmax_scale = _hcu_prescale_q_for_paged_attention(q, softmax_scale)
     return vllm_flash_attn_with_kvcache_interface(
@@ -381,6 +398,47 @@ _HCU_SHORT_Q_AS_DECODE_MAX = int(
 )
 _WELM_PFX_ATTN = get_bool_env_var("WELM_PFX_ATTN", default="true")
 _WELM_PFX_ATTN_MAX_Q = int(os.environ.get("WELM_PFX_ATTN_MAX_Q", "256"))
+
+
+_WELM_DEC_ATTN = get_bool_env_var("WELM_DEC_ATTN", default="true")
+# Decode rows use the vendor paged-attention kernel unless it would drop
+# tokens (see _hcu_paged_attention_covers); batch sizes up to this always use
+# welm_decode_attention. In serving it is not faster than the vendor kernel,
+# so by default it is only the correctness fallback.
+_WELM_DEC_ATTN_MAX_BS = int(os.environ.get("WELM_DEC_ATTN_MAX_BS", "0"))
+
+
+def _hcu_paged_attention_covers(num_blocks, page_size, num_seqs, max_len):
+    """Whether flash_attn_cuda.paged_attention attends to all max_len tokens.
+
+    Its host dispatch (src/paged_attention.hip) replaces any max_seq_len <= 10
+    or > 8192 with num_blocks*block_size/num_seqs + 8192 and sizes the
+    partition grid from that; tokens past it are silently dropped.
+    """
+    return (num_blocks * page_size) // num_seqs + 8192 >= max_len
+
+
+def _use_welm_decode_attention(
+    q, k_cache, v_cache, page_table, window_size, softcap, return_softmax_lse
+):
+    if not _WELM_DEC_ATTN or page_table is None or return_softmax_lse or softcap:
+        return False
+    if window_size is not None and tuple(window_size) != (-1, -1):
+        return False
+    if q.dim() != 4 or q.shape[1] != 1 or q.dtype != torch.bfloat16:
+        return False
+    if k_cache.dtype != torch.bfloat16 or k_cache.dim() != 4 or v_cache.dim() != 4:
+        return False
+    # HCU legacy layout: K [blocks, KVH, PAGE, D], V [blocks, KVH, D, PAGE].
+    page, d = k_cache.shape[2], k_cache.shape[3]
+    if tuple(v_cache.shape[2:]) != (d, page) or q.shape[3] != d:
+        return False
+    bs = q.shape[0]
+    if bs <= _WELM_DEC_ATTN_MAX_BS:
+        return True
+    return not _hcu_paged_attention_covers(
+        k_cache.shape[0], page, bs, page_table.shape[1] * page
+    )
 
 
 def _hcu_prescale_q_for_paged_attention(q, softmax_scale):

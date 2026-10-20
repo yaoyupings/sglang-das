@@ -806,3 +806,137 @@ def welm_prefix_attention(
         num_warps=4,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Decode (q_len=1) split-KV paged attention, fixed-size splits.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _welm_dec_attn_partial_kernel(
+    Q, K, V, BT, SEQK, MID_O, MID_LSE, sm_scale,
+    stride_qb, stride_qh,
+    stride_kb, stride_kh, stride_kp,
+    stride_vb, stride_vh, stride_vd,
+    stride_bt,
+    stride_mo_b, stride_mo_h, stride_mo_s,
+    stride_ml_b, stride_ml_h,
+    G: tl.constexpr, KVH: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
+    BLOCK_M: tl.constexpr, CHUNK_PAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+    b = pid // KVH
+    kvh = pid % KVH
+    kv_len = tl.load(SEQK + b)
+    lo = split * (CHUNK_PAGES * PAGE)
+    if lo >= kv_len:
+        return
+    hi = tl.minimum(lo + CHUNK_PAGES * PAGE, kv_len)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_mask = offs_m < G
+    head = kvh * G + offs_m
+    offs_d = tl.arange(0, D)
+    q = tl.load(Q + b * stride_qb + head[:, None] * stride_qh + offs_d[None, :],
+                mask=m_mask[:, None], other=0.0)
+    offs_p = tl.arange(0, PAGE)
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+    for start in range(lo, hi, PAGE):
+        page = tl.load(BT + b * stride_bt + start // PAGE).to(tl.int64)
+        k = tl.load(K + page * stride_kb + kvh * stride_kh + offs_p[:, None] * stride_kp + offs_d[None, :])
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        qk = tl.where((start + offs_p)[None, :] < hi, qk, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        v = tl.load(V + page * stride_vb + kvh * stride_vh + offs_d[:, None] * stride_vd + offs_p[None, :])
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), tl.trans(v))
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+    o = acc / l_i[:, None]
+    lse = m_i + tl.log(l_i)
+    tl.store(MID_O + b * stride_mo_b + head[:, None] * stride_mo_h + split * stride_mo_s + offs_d[None, :],
+             o, mask=m_mask[:, None])
+    tl.store(MID_LSE + b * stride_ml_b + head * stride_ml_h + split, lse, mask=m_mask)
+
+
+@triton.jit
+def _welm_dec_attn_reduce_kernel(
+    MID_O, MID_LSE, SEQK, SINKS, OUT,
+    stride_mo_b, stride_mo_h, stride_mo_s,
+    stride_ml_b, stride_ml_h,
+    stride_ob, stride_oh,
+    D: tl.constexpr, PAGE: tl.constexpr, CHUNK_PAGES: tl.constexpr,
+    BLOCK_S: tl.constexpr, HAS_SINK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    kv_len = tl.load(SEQK + b)
+    n = tl.cdiv(kv_len, CHUNK_PAGES * PAGE)
+    offs_s = tl.arange(0, BLOCK_S)
+    offs_d = tl.arange(0, D)
+    m = tl.full((), float("-inf"), tl.float32)
+    if HAS_SINK:
+        m = tl.load(SINKS + h).to(tl.float32)
+    denom = tl.zeros((), tl.float32)
+    if HAS_SINK:
+        denom = tl.full((), 1.0, tl.float32)
+    acc = tl.zeros([D], dtype=tl.float32)
+    for s0 in range(0, n, BLOCK_S):
+        s = s0 + offs_s
+        msk = s < n
+        lse = tl.load(MID_LSE + b * stride_ml_b + h * stride_ml_h + s, mask=msk, other=float("-inf"))
+        m_new = tl.maximum(m, tl.max(lse, 0))
+        scale = tl.exp(m - m_new)
+        w = tl.exp(lse - m_new)
+        o = tl.load(MID_O + b * stride_mo_b + h * stride_mo_h + s[:, None] * stride_mo_s + offs_d[None, :],
+                    mask=msk[:, None], other=0.0)
+        acc = acc * scale + tl.sum(o * w[:, None], 0)
+        denom = denom * scale + tl.sum(w, 0)
+        m = m_new
+    out = acc / tl.where(denom > 0, denom, 1.0)
+    tl.store(OUT + b * stride_ob + h * stride_oh + offs_d, out.to(OUT.dtype.element_ty))
+
+
+def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_scale,
+                          max_context_len, sinks=None, out=None, chunk_pages=None,
+                          num_warps=None, num_stages=1, block_s=32):
+    """One query token per row: q [B, H, D] -> out [B, H, D].
+
+    k_cache [blocks, KVH, PAGE, D], v_cache [blocks, KVH, D, PAGE] (HCU legacy
+    layout). Splits are CHUNK_PAGES pages each; the grid covers
+    max_context_len and splits past a row's length exit, so no host-side
+    length is needed (CUDA-graph safe)."""
+    if chunk_pages is None:
+        chunk_pages = 2 if q.shape[0] <= 16 else 4
+    if num_warps is None:
+        num_warps = 4 if q.shape[0] <= 16 else 2
+    B, H, D = q.shape
+    KVH, PAGE = k_cache.shape[1], k_cache.shape[2]
+    G = H // KVH
+    max_splits = triton.cdiv(max_context_len, chunk_pages * PAGE)
+    mid_o = torch.empty((B, H, max_splits, D), dtype=torch.float32, device=q.device)
+    mid_lse = torch.empty((B, H, max_splits), dtype=torch.float32, device=q.device)
+    if out is None:
+        out = torch.empty_like(q)
+    _welm_dec_attn_partial_kernel[(B * KVH, max_splits)](
+        q, k_cache, v_cache, block_table, seq_lens, mid_o, mid_lse, softmax_scale,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        block_table.stride(0),
+        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+        mid_lse.stride(0), mid_lse.stride(1),
+        G=G, KVH=KVH, D=D, PAGE=PAGE, BLOCK_M=max(16, triton.next_power_of_2(G)),
+        CHUNK_PAGES=chunk_pages, num_warps=num_warps, num_stages=num_stages,
+    )
+    _welm_dec_attn_reduce_kernel[(B, H)](
+        mid_o, mid_lse, seq_lens, sinks if sinks is not None else mid_lse, out,
+        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+        mid_lse.stride(0), mid_lse.stride(1),
+        out.stride(0), out.stride(1),
+        D=D, PAGE=PAGE, CHUNK_PAGES=chunk_pages, BLOCK_S=block_s, HAS_SINK=sinks is not None,
+        num_warps=4,
+    )
+    return out
