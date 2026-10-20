@@ -750,6 +750,10 @@ class LayerManager:
                 ).contiguous()
             else:
                 imitated_layer_attn.welm_kv_mirror_proj_bias = None
+            # Keep the fused [qkv | gate | mirror] weight in sync with the new
+            # mirror sources (only once the layer has been merged before).
+            if getattr(imitated_layer_attn, "qkvg_weight", None) is not None:
+                imitated_layer_attn.build_qkvg_weight()
 
         torch.cuda.empty_cache()
 
@@ -1492,6 +1496,7 @@ class Qwen2MoeAttention(nn.Module):
             self.attn_sink = None
         self.attn_sink_cast: Optional[torch.Tensor] = None
         self.qkvg_weight: Optional[torch.Tensor] = None
+        self.qkvgm_weight: Optional[torch.Tensor] = None
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -1602,18 +1607,35 @@ class Qwen2MoeAttention(nn.Module):
             # Keep the target layer's ordinary Q/K/V projection for its own
             # attention, then project every physical mirror consumer with its
             # own K/V weights.  This is important when 48, 49 and 50 all
-            if use_qkvg:
-                qkv = _welm_linear(hidden_states, self.qkvg_weight)
-                qkv, gate = qkv.split(
-                    [qkv.shape[-1] - self.num_heads, self.num_heads], dim=-1
+            if use_qkvg and self.qkvgm_weight is not None:
+                # One GEMM: [q k v | gate | mirror K/V for every consumer].
+                out = _welm_linear(hidden_states, self.qkvgm_weight)
+                n_qkvg = self.qkvg_weight.shape[0]
+                qkv, gate = out[..., :n_qkvg].split(
+                    [n_qkvg - self.num_heads, self.num_heads], dim=-1
                 )
+                mirror_qkv = out[..., n_qkvg:]
+                kv_width = self.kv_size
+                for i, mirror_layer_id in enumerate(self.welm_kv_mirror_source_ids):
+                    off = i * 2 * kv_width
+                    kv_mirror_states[mirror_layer_id] = (
+                        mirror_qkv[..., off : off + kv_width],
+                        mirror_qkv[..., off + kv_width : off + 2 * kv_width],
+                    )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             else:
-                qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            for mirror_layer_id, mirror_k, mirror_v in _welm_mirror_kv_from_projection(
-                self, hidden_states, qkv=qkv
-            ):
-                kv_mirror_states[mirror_layer_id] = (mirror_k, mirror_v)
+                if use_qkvg:
+                    qkv = _welm_linear(hidden_states, self.qkvg_weight)
+                    qkv, gate = qkv.split(
+                        [qkv.shape[-1] - self.num_heads, self.num_heads], dim=-1
+                    )
+                else:
+                    qkv, _ = self.qkv_proj(hidden_states)
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                for mirror_layer_id, mirror_k, mirror_v in _welm_mirror_kv_from_projection(
+                    self, hidden_states, qkv=qkv
+                ):
+                    kv_mirror_states[mirror_layer_id] = (mirror_k, mirror_v)
         elif self.kv_mirror_layer_idx in self.kv_mirror_layers:
             kv_activation = kv_mirror_states.get(self.kv_mirror_layer_idx)
             # A draft decode may run without a reconstructed target activation;
@@ -1702,7 +1724,7 @@ class Qwen2MoeAttention(nn.Module):
             q_ratio = (
                 self.scaling / (self.head_dim**-0.5) if q_prescaled else 1.0
             )
-            k = welm_qk_norm_rope(
+            k, q = welm_qk_norm_rope(
                 q,
                 k,
                 positions,
@@ -1712,6 +1734,9 @@ class Qwen2MoeAttention(nn.Module):
                 self.k_norm.weight if self.k_norm is not None else None,
                 self.k_norm.eps if self.k_norm is not None else 1e-6,
                 q_scale=q_ratio,
+                # q is a strided view of the fused projection output; a
+                # contiguous q here saves the attention backend a copy kernel.
+                return_q=True,
             )
             q_prescaled = q_prescaled and q_ratio != 1.0
         else:
@@ -1753,14 +1778,7 @@ class Qwen2MoeAttention(nn.Module):
         no extra memory and later in-place weight updates stay consistent.
         """
         self.qkvg_weight = None
-        if (
-            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers
-            and not hasattr(self, "qkv_proj_weight")
-        ):
-            # Imitated by a layer that does not exist yet (the NextN draft
-            # layer mirrors target layer 0 and attaches qkv_proj_weight in its
-            # own post-init, possibly after graph capture): keep it unmerged.
-            return
+        self.qkvgm_weight = None
         if (
             not _WELM_MERGE_GATE_PROJ
             or not self.gated_self_attention_headwise
@@ -1776,13 +1794,29 @@ class Qwen2MoeAttention(nn.Module):
         else:
             base = self.qkv_proj.weight.data
         n = base.shape[0]
-        merged = torch.cat([base, gate_w], dim=0).contiguous()
+        g = gate_w.shape[0]
+        # A target layer imitated by KV-mirror layers also projects their K/V
+        # (welm_kv_mirror_proj_weight).  Append those rows so the layer runs
+        # one GEMM instead of three.  LayerManager.post_init calls this again
+        # whenever the mirror sources change (e.g. when the MTP draft loads).
+        mirror_w = getattr(self, "welm_kv_mirror_proj_weight", None)
+        fuse_mirror = (
+            mirror_w is not None
+            and getattr(self, "welm_kv_mirror_proj_bias", None) is None
+            and mirror_w.dtype == base.dtype
+            and mirror_w.device == base.device
+        )
+        parts = [base, gate_w] + ([mirror_w] if fuse_mirror else [])
+        merged = torch.cat(parts, dim=0).contiguous()
         if hasattr(self, "qkv_proj_weight"):
             self.qkv_proj_weight = merged[:n]
         else:
             self.qkv_proj.weight.data = merged[:n]
-        self.gate_proj.weight.data = merged[n:]
-        self.qkvg_weight = merged
+        self.gate_proj.weight.data = merged[n : n + g]
+        self.qkvg_weight = merged[: n + g]
+        if fuse_mirror:
+            self.welm_kv_mirror_proj_weight = merged[n + g :]
+            self.qkvgm_weight = merged
 
     def post_load_weights(self):
         if self.attn_sink is not None:

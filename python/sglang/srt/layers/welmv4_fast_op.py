@@ -214,6 +214,8 @@ def _welm_qk_norm_rope_kernel(
     ROPE_DIM: tl.constexpr,
     HAS_K_NORM: tl.constexpr,
     SCALE_Q: tl.constexpr,
+    q_out_ptr=None,
+    Q_OUT: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     HALF: tl.constexpr = ROPE_DIM // 2
@@ -255,17 +257,23 @@ def _welm_qk_norm_rope_kernel(
     q2 = tl.load(qbase + NOPE + HALF + dh[None, :], mask=qmask, other=0.0).to(tl.float32)
     r1 = (q1 * cos[None, :] - q2 * sin[None, :]).to(out_ty)
     r2 = (q1 * sin[None, :] + q2 * cos[None, :]).to(out_ty)
+    # Q_OUT: write the full q into a contiguous [T, QH*HEAD_DIM] buffer so the
+    # attention call needs no strided->contiguous copy; values are identical.
+    if Q_OUT:
+        dst = q_out_ptr + t.to(tl.int64) * (QH * HEAD_DIM) + qh[:, None] * HEAD_DIM
+    else:
+        dst = qbase
+    nmask = qmask & (d[None, :] < NOPE)
     if SCALE_Q:
-        qn = tl.load(qbase + d[None, :], mask=qmask & (d[None, :] < NOPE), other=0.0)
-        tl.store(
-            qbase + d[None, :],
-            (qn.to(tl.float32) * q_scale).to(out_ty),
-            mask=qmask & (d[None, :] < NOPE),
-        )
+        qn = tl.load(qbase + d[None, :], mask=nmask, other=0.0)
+        tl.store(dst + d[None, :], (qn.to(tl.float32) * q_scale).to(out_ty), mask=nmask)
         r1 = (r1.to(tl.float32) * q_scale).to(out_ty)
         r2 = (r2.to(tl.float32) * q_scale).to(out_ty)
-    tl.store(qbase + NOPE + dh[None, :], r1, mask=qmask)
-    tl.store(qbase + NOPE + HALF + dh[None, :], r2, mask=qmask)
+    elif Q_OUT:
+        qn = tl.load(qbase + d[None, :], mask=nmask, other=0.0)
+        tl.store(dst + d[None, :], qn, mask=nmask)
+    tl.store(dst + NOPE + dh[None, :], r1, mask=qmask)
+    tl.store(dst + NOPE + HALF + dh[None, :], r2, mask=qmask)
 
 
 def welm_qk_norm_rope(
@@ -278,16 +286,23 @@ def welm_qk_norm_rope(
     k_gamma: torch.Tensor = None,
     eps: float = 1e-6,
     q_scale: float = 1.0,
+    return_q: bool = False,
 ):
-    """q, k: (T, heads*head_dim) row views (q is updated in place). Returns k_out
-    (T, kv_heads*head_dim), contiguous."""
+    """q, k: (T, heads*head_dim) row views. Returns k_out (T, kv_heads*head_dim),
+    contiguous; q is updated in place, or with ``return_q`` written to a new
+    contiguous buffer and returned as ``(k_out, q_out)``."""
     T = q.shape[0]
     qh = q.shape[1] // head_dim
     kh = k.shape[1] // head_dim
     assert q.stride(1) == 1 and k.stride(1) == 1
     k_out = torch.empty((T, kh * head_dim), dtype=k.dtype, device=k.device)
+    q_out = (
+        torch.empty((T, qh * head_dim), dtype=q.dtype, device=q.device)
+        if return_q
+        else None
+    )
     if T == 0:
-        return k_out
+        return (k_out, q_out) if return_q else k_out
     _welm_qk_norm_rope_kernel[(T,)](
         q,
         k,
@@ -308,9 +323,11 @@ def welm_qk_norm_rope(
         ROPE_DIM=rope_dim,
         HAS_K_NORM=k_gamma is not None,
         SCALE_Q=q_scale != 1.0,
+        q_out_ptr=q_out,
+        Q_OUT=return_q,
         num_warps=4,
     )
-    return k_out
+    return (k_out, q_out) if return_q else k_out
 
 
 # ---------------------------------------------------------------------------
