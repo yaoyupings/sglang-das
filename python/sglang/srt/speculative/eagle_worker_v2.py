@@ -1096,6 +1096,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return_hidden_states_before_norm=self.need_hidden_states_before_norm,
         )
         forward_batch.return_logprob = False
+        if (
+            forward_batch.enable_kv_mirror
+            and target_hidden_states is not None
+            and forward_batch.extend_num_tokens is not None
+            and target_hidden_states.shape[0] == forward_batch.extend_num_tokens
+            and forward_batch.extend_num_tokens != forward_batch.batch_size
+        ):
+            # The target prefill ran without KV-mirror row reduction (prefill
+            # CUDA graph), so it returned every token's hidden state.  The
+            # draft must then also keep all rows, or its mirror layer would
+            # reduce hidden states but not the residual.
+            forward_batch.enable_kv_mirror = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
