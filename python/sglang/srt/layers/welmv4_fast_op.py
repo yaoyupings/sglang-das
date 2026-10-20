@@ -756,6 +756,8 @@ def welm_prefix_attention(
     out: torch.Tensor = None,
     num_splits: int = 32,
     block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ):
     total_q, H, D = q.shape
     KVH, PAGE = k_cache.shape[1], k_cache.shape[2]
@@ -776,7 +778,7 @@ def welm_prefix_attention(
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         mid_lse.stride(0), mid_lse.stride(1),
         G=G, KVH=KVH, D=D, PAGE=PAGE, BLOCK_M=block_m, NUM_SPLITS=num_splits,
-        num_warps=4, num_stages=1,
+        num_warps=num_warps, num_stages=num_stages,
     )
     _welm_pfx_attn_reduce_kernel[(total_q, H)](
         mid_o, mid_lse, sinks if sinks is not None else mid_lse, out,
