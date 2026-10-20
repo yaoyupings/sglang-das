@@ -1757,9 +1757,6 @@ class FlashAttentionBackend(AttentionBackend):
                     or forward_batch.forward_mode == ForwardMode.EXTEND
                 )
                 and cu_seqlens_q is metadata.cu_seqlens_q
-                # 8 < q <= 256: the split-KV prefix kernel already serves the
-                # one-token rows efficiently.
-                and not (8 < max_seqlen_q <= _WELM_PFX_ATTN_MAX_Q_BACKEND)
                 and not use_cascade_attn
                 and not use_local_attn
                 and not layer.is_cross_attention
