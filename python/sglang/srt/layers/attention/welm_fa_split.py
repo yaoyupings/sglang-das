@@ -21,7 +21,7 @@ import triton.language as tl
 
 SPLIT_CHUNK = 2048
 # Split only when the query blocks alone cannot fill the device.
-SPLIT_MAX_TOTAL_Q = 4096
+SPLIT_MAX_TOTAL_Q = 2560
 SPLIT_MIN_PREFIX = 2048
 
 _meta_cache: dict = {}

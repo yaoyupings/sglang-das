@@ -621,7 +621,7 @@ def _hcu_paged_prefill_no_sync(
     return res[0]
 
 
-_WELM_FA256_CFG = int(os.environ.get("SGLANG_WELM_FA256_CFG", "4"))
+_WELM_FA256_CFG = int(os.environ.get("SGLANG_WELM_FA256_CFG", "20"))
 # Split-KV prefill for short new segments over long cached prefixes.
 _WELM_FA_SPLIT = get_bool_env_var("WELM_FA_SPLIT", default="true")
 _welm_fa256_mod = None
@@ -629,11 +629,12 @@ _welm_fa256_mod = None
 
 def _welm_fa256():
     """Standalone hdim-256 bf16 forward (welm_fa256.so); None when disabled/unavailable.
-    SGLANG_WELM_FA256_CFG: 4 = 128x64 tile (fast), 1 = 64x32 (bit-exact with vendor), 0 = off."""
+    SGLANG_WELM_FA256_CFG: 20 = 128x32 tile (fastest, bit-exact with cfg 1), 4 = 128x64,
+    1 = 64x32 (bit-exact with vendor), 0 = off."""
     global _welm_fa256_mod
     if _welm_fa256_mod is None:
         _welm_fa256_mod = False
-        if _WELM_FA256_CFG in (1, 4):
+        if _WELM_FA256_CFG in (1, 4, 20):
             try:
                 from sglang.srt.layers.attention import welm_fa256
 
