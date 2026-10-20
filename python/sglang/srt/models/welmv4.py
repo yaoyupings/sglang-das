@@ -482,28 +482,35 @@ def welm_spec_n_gram_input_ids(
     tpos = positions.to(torch.int64) + shift
 
     if mode.is_extend_without_speculative():
-        # Prefill: per-token request rows and in-segment offsets.
-        seg_lens = forward_batch.extend_seq_lens
+        # Prefill: per-token request rows and in-segment offsets.  Map tokens
+        # to segments with searchsorted rather than repeat_interleave: under a
+        # prefill CUDA graph ``num_tokens`` is the padded bucket size while
+        # the segment lengths sum to the real token count, and
+        # repeat_interleave(output_size=...) would read out of bounds.
+        seg_lens = forward_batch.extend_seq_lens.to(torch.int64)
         bs = seg_lens.shape[0]
-        rows = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64), seg_lens, output_size=num_tokens
-        )
-        seg_start = torch.cumsum(seg_lens, 0) - seg_lens
-        idx = torch.arange(num_tokens, device=ids.device) - torch.repeat_interleave(
-            seg_start, seg_lens, output_size=num_tokens
-        )
-        lens = torch.repeat_interleave(seg_lens, seg_lens, output_size=num_tokens)
+        seg_end = torch.cumsum(seg_lens, 0)
+        tok = torch.arange(num_tokens, device=ids.device)
+        seg = torch.searchsorted(seg_end, tok, right=True)
+        valid = seg < bs
+        seg = torch.clamp(seg, max=bs - 1)
+        rows = forward_batch.req_pool_indices.to(torch.int64)[seg]
+        idx = tok - (seg_end - seg_lens)[seg]
+        lens = seg_lens[seg]
         # Keep only the tail of each segment so no ring slot is written twice.
-        tail = idx >= lens - slots
-        ring[rows[tail], torch.remainder(tpos[tail], slots)] = ids[tail]
+        # Masked-out writes go to the reserved padding row 0 instead of being
+        # filtered with a boolean index, which would need a host sync and
+        # break prefill CUDA graph capture.
+        tail = valid & (idx >= lens - slots)
+        ring[torch.where(tail, rows, 0), torch.remainder(tpos, slots)] = ids
         if not is_draft:
             # Target prefill uses the exact scheduler grams; also record the
             # predecessors of short segments (prefix-cache hits, chunking).
-            first = idx == 0
+            first = valid & (idx == 0)
             for back, gram in zip((1, 2, 3), current.input_ids_grams):
                 p = tpos - back
                 sel = first & (p >= 0) & (lens + back <= slots)
-                ring[rows[sel], torch.remainder(p[sel], slots)] = gram[sel].to(
+                ring[torch.where(sel, rows, 0), torch.remainder(p, slots)] = gram.to(
                     torch.int64
                 )
             return current

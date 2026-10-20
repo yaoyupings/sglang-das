@@ -710,6 +710,13 @@ class FlashAttentionBackend(AttentionBackend):
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
             m.max_seq_len_k = self.max_context_len
+            if forward_batch.enable_kv_mirror:
+                # KV-mirror layers attend with one query row per request
+                # (mirrors the eager extend branch).
+                m.mirror_cu_seqlens_q = torch.arange(
+                    0, bs + 1, dtype=torch.int32, device=m.cu_seqlens_q.device
+                )
+                m.mirror_max_seq_len_q = 1
         self.forward_metadata = m
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

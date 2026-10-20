@@ -365,6 +365,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # TcPiecewise resolves by running a compile pass that calls back into
         # capture_prepare / _run_forward, so these fields must exist first.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        # WeLM over-encoding n-gram ids (gram n -> [max_num_tokens] int64).
+        self._prefill_ngram_buffers: Optional[Dict[int, torch.Tensor]] = None
         self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
         self._capture_req_slots = 1
@@ -473,6 +475,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
+                if model_runner.server_args.prepare_n_gram_inputs:
+                    self._prefill_ngram_buffers = {
+                        n: torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                        for n in (2, 3, 4)
+                    }
 
         server_args = model_runner.server_args
         self.enable_cp_v2_bcg_capture = isinstance(
@@ -1372,7 +1379,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 max_seq_len_override=getattr(self, "max_context_size", None),
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            forward_batch.n_gram_input_ids = self._static_ngram_ids(num_tokens)
         return forward_batch, self.model_runner.attn_backend
+
+    def _static_ngram_ids(self, num_tokens: int):
+        if self._prefill_ngram_buffers is None:
+            return None
+        from sglang.srt.managers.schedule_batch import NGramInputIds
+
+        return NGramInputIds(
+            input_ids_grams=[
+                self._prefill_ngram_buffers[n][:num_tokens] for n in (2, 3, 4)
+            ]
+        )
+
+    def _load_ngram_ids(self, forward_batch: ForwardBatch, raw: int, padded: int):
+        """Copy the live n-gram ids into the captured buffers; zero the pad."""
+        if self._prefill_ngram_buffers is None:
+            return None
+        live = forward_batch.n_gram_input_ids
+        for n in (2, 3, 4):
+            buf = self._prefill_ngram_buffers[n]
+            gram = live.get_gram(n) if live is not None else None
+            if gram is not None and gram.shape[0] == raw:
+                buf[:raw].copy_(gram)
+            else:
+                buf[:raw].zero_()
+            if padded > raw:
+                buf[raw:padded].zero_()
+        return self._static_ngram_ids(padded)
 
     def capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
@@ -1632,6 +1667,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
             max_seq_len_override=getattr(self, "max_context_size", None),
+        )
+        static_forward_batch.n_gram_input_ids = self._load_ngram_ids(
+            forward_batch, num_tokens, static_num_tokens
         )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (

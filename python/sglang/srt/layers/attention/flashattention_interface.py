@@ -379,6 +379,8 @@ WELM_Q_PRESCALED = False
 _HCU_SHORT_Q_AS_DECODE_MAX = int(
     os.environ.get("SGLANG_HCU_SHORT_Q_AS_DECODE_MAX", "8")
 )
+_WELM_PFX_ATTN = get_bool_env_var("WELM_PFX_ATTN", default="true")
+_WELM_PFX_ATTN_MAX_Q = int(os.environ.get("WELM_PFX_ATTN_MAX_Q", "256"))
 
 
 def _hcu_prescale_q_for_paged_attention(q, softmax_scale):
@@ -890,6 +892,42 @@ def vllm_flash_attn_varlen_func(
             out.copy_(result)
             return out
         return result
+
+    # Short queries over a long paged prefix (prefill with prefix-cache hits):
+    # split-KV kernel instead of the query-block-parallel varlen kernel, which
+    # leaves most of the device idle here.  Verify-sized queries keep the
+    # short-q-as-decode path below.
+    if (
+        _is_hcu
+        and _WELM_PFX_ATTN
+        and causal
+        and layout == "legacy_bhsd"
+        and tuple(window_size) == (-1, -1)
+        and block_table is not None
+        and seqused_k is not None
+        and (
+            _HCU_SHORT_Q_AS_DECODE_MAX < max_seqlen_q <= _WELM_PFX_ATTN_MAX_Q
+            # One query row per request: 1-token prefills and the KV-mirror
+            # layers (last token per request against the full sequence).
+            or max_seqlen_q == 1
+            # Under a prefill CUDA graph the vendor varlen path would bake the
+            # capture-time KV total (total_k_hint) into the launch; this
+            # kernel reads every length on device, so prefix replays are exact.
+            or torch.cuda.is_current_stream_capturing()
+        )
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.bfloat16
+        and q_descale is None
+        and k.dim() == 4
+        and q.shape[1] % k.shape[1] == 0
+    ):
+        from sglang.srt.layers.welmv4_fast_op import welm_prefix_attention
+
+        return welm_prefix_attention(
+            q, k, v, block_table, seqused_k, cu_seqlens_q, max_seqlen_q,
+            softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+            sinks=sinks, out=out,
+        )
 
     # The HCU paged "MTP" branch (selected for uniform 1 < max_seqlen_q < 16
     # batches) folds query tokens into heads and rejects or ignores

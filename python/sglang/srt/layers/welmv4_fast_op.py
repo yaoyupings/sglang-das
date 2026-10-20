@@ -635,3 +635,155 @@ def warmup_skinny_gemm(w: torch.Tensor) -> None:
         skinny_gemm(x, w)
         prev = max_m
     torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Split-KV attention for short queries over a long paged prefix (prefill with
+# prefix-cache hits).  The vendor varlen prefill kernel parallelises only over
+# query blocks, so a few dozen new tokens against a 9k-30k cached prefix runs
+# on a handful of workgroups (1.7-5.4 ms per layer).  Here every split of the
+# KV range is its own program, and all query heads sharing a KV head are
+# folded into the M dimension so each page is read once per split.
+# KV layout is HCU legacy_bhsd: k [blocks, kv_heads, PAGE, D],
+# v [blocks, kv_heads, D, PAGE].  Lengths are read on device (graph-safe).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _welm_pfx_attn_partial_kernel(
+    Q, K, V, BT, SEQK, CUQ, MID_O, MID_LSE, sm_scale,
+    stride_qt, stride_qh,
+    stride_kb, stride_kh, stride_kp,
+    stride_vb, stride_vh, stride_vd,
+    stride_bt,
+    stride_mo_t, stride_mo_h, stride_mo_s,
+    stride_ml_t, stride_ml_h,
+    G: tl.constexpr, KVH: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
+    BLOCK_M: tl.constexpr, NUM_SPLITS: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    split = tl.program_id(2)
+    b = pid_bh // KVH
+    kvh = pid_bh % KVH
+    q_start = tl.load(CUQ + b)
+    n_q = tl.load(CUQ + b + 1) - q_start
+    rows = n_q * G
+    if pid_m * BLOCK_M >= rows:
+        return
+    kv_len = tl.load(SEQK + b)
+    prefix = kv_len - n_q
+    split_len = tl.cdiv(tl.cdiv(kv_len, NUM_SPLITS), PAGE) * PAGE
+    k_lo = split * split_len
+    k_hi = tl.minimum(k_lo + split_len, kv_len)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < rows
+    tok = offs_m // G
+    head = kvh * G + offs_m % G
+    offs_d = tl.arange(0, D)
+    q = tl.load(
+        Q + (q_start + tok)[:, None] * stride_qt + head[:, None] * stride_qh + offs_d[None, :],
+        mask=m_mask[:, None], other=0.0,
+    )
+    q_pos = prefix + tok
+    offs_p = tl.arange(0, PAGE)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+    for start in range(k_lo, k_hi, PAGE):
+        page = tl.load(BT + b * stride_bt + start // PAGE)
+        k = tl.load(K + page * stride_kb + kvh * stride_kh + offs_p[:, None] * stride_kp + offs_d[None, :])
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        k_pos = start + offs_p
+        valid = (k_pos[None, :] <= q_pos[:, None]) & (k_pos[None, :] < k_hi)
+        qk = tl.where(valid, qk, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        p = tl.exp(qk - m_safe[:, None])
+        alpha = tl.exp(m_i - m_safe)
+        v = tl.load(V + page * stride_vb + kvh * stride_vh + offs_d[:, None] * stride_vd + offs_p[None, :])
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), tl.trans(v))
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+
+    has = l_i > 0
+    o = acc / tl.where(has, l_i, 1.0)[:, None]
+    lse = tl.where(has, m_i + tl.log(tl.where(has, l_i, 1.0)), float("-inf"))
+    t_abs = q_start + tok
+    tl.store(
+        MID_O + t_abs[:, None] * stride_mo_t + head[:, None] * stride_mo_h + split * stride_mo_s + offs_d[None, :],
+        o, mask=m_mask[:, None],
+    )
+    tl.store(MID_LSE + t_abs * stride_ml_t + head * stride_ml_h + split, lse, mask=m_mask)
+
+
+@triton.jit
+def _welm_pfx_attn_reduce_kernel(
+    MID_O, MID_LSE, SINKS, OUT,
+    stride_mo_t, stride_mo_h, stride_mo_s,
+    stride_ml_t, stride_ml_h,
+    stride_ot, stride_oh,
+    D: tl.constexpr, NUM_SPLITS: tl.constexpr, HAS_SINK: tl.constexpr,
+):
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    offs_s = tl.arange(0, NUM_SPLITS)
+    offs_d = tl.arange(0, D)
+    lse = tl.load(MID_LSE + t * stride_ml_t + h * stride_ml_h + offs_s)
+    m = tl.max(lse, 0)
+    if HAS_SINK:
+        sink = tl.load(SINKS + h).to(tl.float32)
+        m = tl.maximum(m, sink)
+    w = tl.exp(lse - m)
+    denom = tl.sum(w, 0)
+    if HAS_SINK:
+        denom += tl.exp(sink - m)
+    o = tl.load(MID_O + t * stride_mo_t + h * stride_mo_h + offs_s[:, None] * stride_mo_s + offs_d[None, :])
+    out = tl.sum(o * w[:, None], 0) / denom
+    tl.store(OUT + t * stride_ot + h * stride_oh + offs_d, out.to(OUT.dtype.element_ty))
+
+
+def welm_prefix_attention(
+    q: torch.Tensor,            # [total_q, H, D]
+    k_cache: torch.Tensor,      # [blocks, KVH, PAGE, D]
+    v_cache: torch.Tensor,      # [blocks, KVH, D, PAGE]
+    block_table: torch.Tensor,  # [bs, W] int32
+    seqused_k: torch.Tensor,    # [bs] total kv length incl. new tokens
+    cu_seqlens_q: torch.Tensor, # [bs + 1]
+    max_seqlen_q: int,
+    softmax_scale: float,
+    sinks: torch.Tensor = None, # [H] or None
+    out: torch.Tensor = None,
+    num_splits: int = 32,
+    block_m: int = 32,
+):
+    total_q, H, D = q.shape
+    KVH, PAGE = k_cache.shape[1], k_cache.shape[2]
+    G = H // KVH
+    bs = cu_seqlens_q.shape[0] - 1
+    mid_o = torch.empty((total_q, H, num_splits, D), dtype=torch.float32, device=q.device)
+    mid_lse = torch.empty((total_q, H, num_splits), dtype=torch.float32, device=q.device)
+    if out is None:
+        out = torch.empty_like(q)
+    grid = (bs * KVH, triton.cdiv(max_seqlen_q * G, block_m), num_splits)
+    _welm_pfx_attn_partial_kernel[grid](
+        q, k_cache, v_cache, block_table, seqused_k, cu_seqlens_q, mid_o, mid_lse,
+        softmax_scale,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        block_table.stride(0),
+        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+        mid_lse.stride(0), mid_lse.stride(1),
+        G=G, KVH=KVH, D=D, PAGE=PAGE, BLOCK_M=block_m, NUM_SPLITS=num_splits,
+        num_warps=4, num_stages=1,
+    )
+    _welm_pfx_attn_reduce_kernel[(total_q, H)](
+        mid_o, mid_lse, sinks if sinks is not None else mid_lse, out,
+        mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
+        mid_lse.stride(0), mid_lse.stride(1),
+        out.stride(0), out.stride(1),
+        D=D, NUM_SPLITS=num_splits, HAS_SINK=sinks is not None,
+        num_warps=4,
+    )
+    return out
