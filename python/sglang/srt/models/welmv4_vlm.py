@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import os
 from types import SimpleNamespace
@@ -863,9 +862,13 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             input_ids_grams=logical_grams,
             input_ids_buffer=logical_buffer,
         )
-        logical_batch = copy.copy(forward_batch)
-        setattr(logical_batch, state_attr, logical_state)
-        return logical_batch
+        # Swap the state on the original batch instead of copying it: the
+        # attention backend reads the batch from the forward context, so
+        # per-forward fields the body sets (e.g. KV-mirror custom_last_index)
+        # must land on that same object.  forward() restores the original.
+        forward_batch._welm_vl_saved_oe_state = (state_attr, oe_state)
+        setattr(forward_batch, state_attr, logical_state)
+        return forward_batch
 
     def _get_image_embedding_and_mask(
         self,
@@ -983,14 +986,19 @@ class WeLMV4VLMForConditionalGeneration(WeLMV4MoeForCausalLM):
             input_embeds, logical_input_ids, logical_batch = (
                 self._build_multimodal_input_embeds(input_ids, forward_batch)
             )
-            return super().forward(
-                input_ids=logical_input_ids,
-                positions=positions,
-                forward_batch=logical_batch,
-                input_embeds=input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_oe_fusion=True,
-            )
+            try:
+                return super().forward(
+                    input_ids=logical_input_ids,
+                    positions=positions,
+                    forward_batch=logical_batch,
+                    input_embeds=input_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_oe_fusion=True,
+                )
+            finally:
+                saved = forward_batch.__dict__.pop("_welm_vl_saved_oe_state", None)
+                if saved is not None:
+                    setattr(forward_batch, saved[0], saved[1])
 
         return super().forward(
             input_ids=input_ids,

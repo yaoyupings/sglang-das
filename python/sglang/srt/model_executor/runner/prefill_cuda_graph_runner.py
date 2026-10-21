@@ -1173,6 +1173,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
+        # Media batches compose embeddings in the outer model.forward from
+        # pad-hash ids the captured body never saw; run them eagerly.
+        if forward_batch.contains_mm_inputs():
+            return False
+
         # Non-DP local check (sole decision for tp-only).
         if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,
@@ -1779,6 +1784,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ie = layer_kwargs.get("input_embeds")
                 if ie is None and ie_idx is not None and len(args) > ie_idx:
                     ie = args[ie_idx]
+                if ie is None and args:
+                    # Text-only batch on a multimodal model: the outer forward
+                    # passes no embeddings, but the body reads the slot.
+                    ie = self.model_runner.model.get_input_embeddings()(args[0])
                 if ie is not None:
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens

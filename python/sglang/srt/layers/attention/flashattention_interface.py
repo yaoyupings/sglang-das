@@ -1065,12 +1065,15 @@ def vllm_flash_attn_varlen_func(
             and q.dtype == torch.bfloat16
             and k.dim() == 4
             and q.shape[1] * n <= k.shape[1] * 64
+            # The multi-token mode applies per-folded-head sinks only for
+            # n == 2; for n > 2 it silently drops them (kt2/pa_mtp_map.py).
+            and (sinks is None or n == 2)
             and _hcu_paged_attention_covers(
                 k.shape[0], k.shape[2], bs, block_table.shape[1] * k.shape[2]
             )
         ):
             # The paged kernel's multi-token mode reads each row's KV once for
-            # all n queries (bottom-right causal, per-folded-head sinks); the
+            # all n queries (bottom-right causal); the
             # expansion below reads it n times.
             result = vllm_flash_attn_with_kvcache(
                 q=q.view(bs, n, q.shape[1], q.shape[2]),
