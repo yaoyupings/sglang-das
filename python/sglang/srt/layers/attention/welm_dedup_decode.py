@@ -29,8 +29,24 @@ _mod = None
 _bufs = {}
 
 
+class _VendorPA:
+    @staticmethod
+    def pa_partial(*args):
+        from flash_attn.flash_attn_interface import flash_attn_cuda
+
+        return flash_attn_cuda.paged_attention_partial(*args)
+
+
 def _pa():
     global _mod
+    if _mod is None and os.environ.get("WELM_VENDOR_FA", "auto").lower() in ("auto", "1", "true"):
+        try:
+            from flash_attn.flash_attn_interface import flash_attn_cuda
+
+            if hasattr(flash_attn_cuda, "paged_attention_partial"):
+                _mod = _VendorPA
+        except Exception:
+            pass
     if _mod is None:
         so = os.path.join(os.path.dirname(__file__), "welm_pa_part.so")
         spec = importlib.util.spec_from_file_location("welm_pa_part", so)

@@ -661,6 +661,36 @@ _WELM_FA_SPLIT = get_bool_env_var("WELM_FA_SPLIT", default="true")
 _welm_fa256_mod = None
 
 
+class _VendorFA256:
+    """fa256-compatible wrapper around the vendor varlen_fwd. Builds that carry
+    the WeLM patches (paged_attention_partial, dim-256 sink epilogue) are
+    1.3-3.8x faster than welm_fa256.so on WeLM prefill shapes."""
+
+    @staticmethod
+    def varlen_fwd256(q, k, v, out, cu_q, cu_k, max_q, max_k, scale, causal,
+                      wl, wr, sinks, cfg):
+        from flash_attn.flash_attn_interface import flash_attn_cuda
+
+        r = flash_attn_cuda.varlen_fwd(
+            q, k, v, out, cu_q, cu_k, None, None, None, None, max_q, max_k, 0.0,
+            scale, False, causal, wl, wr, 0.0, False, None, None, None, None, sinks,
+        )
+        return r[0], r[5]
+
+
+def _vendor_fa_has_welm_patches():
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_cuda
+
+        return hasattr(flash_attn_cuda, "paged_attention_partial")
+    except Exception:
+        return False
+
+
+# auto: use the vendor kernel when the installed flash_attn carries the WeLM patches.
+_WELM_VENDOR_FA = os.environ.get("WELM_VENDOR_FA", "auto").lower()
+
+
 def _welm_fa256():
     """Standalone hdim-256 bf16 forward (welm_fa256.so); None when disabled/unavailable.
     SGLANG_WELM_FA256_CFG: 20 = 128x32 tile (fastest, bit-exact with cfg 1), 4 = 128x64,
@@ -668,6 +698,11 @@ def _welm_fa256():
     global _welm_fa256_mod
     if _welm_fa256_mod is None:
         _welm_fa256_mod = False
+        if _WELM_VENDOR_FA in ("1", "true") or (
+            _WELM_VENDOR_FA == "auto" and _vendor_fa_has_welm_patches()
+        ):
+            _welm_fa256_mod = _VendorFA256
+            return _welm_fa256_mod
         if _WELM_FA256_CFG in (1, 4, 20):
             try:
                 from sglang.srt.layers.attention import welm_fa256
