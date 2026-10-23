@@ -2209,6 +2209,12 @@ def is_hybrid_swa_model(
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
     }
+    if (
+        os.environ.get("WELM_HYBRID_SWA", "0") == "1"
+        and any(a in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration") for a in model_architectures)
+        and getattr(hf_text_config, "sliding_window_size_layerwise", None)
+    ):
+        return True
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
         if (
@@ -2230,6 +2236,19 @@ def get_hybrid_layer_ids(
     hf_text_config: PretrainedConfig,
 ):
     num_hidden_layers = hf_text_config.num_hidden_layers
+    welm_windows = getattr(hf_text_config, "sliding_window_size_layerwise", None)
+    if welm_windows and any(
+        a in ("WeLMV4MoeForCausalLM", "WeLMV4VLMForConditionalGeneration") for a in model_architectures
+    ):
+        # WeLM: layers whose window is below the full context are sliding.
+        full_limit = int(getattr(hf_text_config, "sliding_window", 0) or 0) or 1 << 30
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if 0 < int(welm_windows[i]) < full_limit
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if i not in set(swa_attention_layer_ids)
+        ]
+        return swa_attention_layer_ids, full_attention_layer_ids
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0

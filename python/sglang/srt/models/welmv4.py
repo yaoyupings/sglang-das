@@ -64,6 +64,7 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
@@ -158,12 +159,21 @@ class WelmV4CommunicatorRMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if post_residual_addition is not None and residual is not None:
+            residual = residual + post_residual_addition
         output = self.norm(x, residual, **kwargs)
         if not kwargs and residual is None and isinstance(output, tuple):
             return output[0]
         return output
+
+
+def _welm_get_tp_group():
+    from sglang.srt.distributed import get_tp_group
+
+    return get_tp_group()
 
 
 def _welm_dump_enabled() -> bool:
@@ -507,6 +517,17 @@ def welm_spec_n_gram_input_ids(
     num_tokens = input_ids.shape[0]
     if num_tokens == 0 or mode.is_idle():
         return current
+    if (
+        current is not None
+        and len(current.input_ids_grams) > 0
+        and 0 < current.input_ids_grams[0].shape[0] < num_tokens
+    ):
+        # DP attention pads the batch to a multiple of the attention-TP size;
+        # pad the scheduler's grams the same way (padding rows are discarded).
+        pad = num_tokens - current.input_ids_grams[0].shape[0]
+        current.input_ids_grams = [
+            torch.cat([g, g.new_zeros((pad, *g.shape[1:]))]) for g in current.input_ids_grams
+        ]
     ring = WelmSpecNgramRing.ensure(input_ids.device)
     slots = ring.shape[1]
     ids = input_ids.to(torch.int64)
@@ -1011,6 +1032,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
         self.gate.weight.data = self.gate.weight.to(torch.float32)
+        # With an a2a backend (DeepEP) every rank holds its own tokens and the
+        # combine returns complete per-token outputs: the shared expert is
+        # replicated and no TP all-reduce follows the MoE.
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        self.use_a2a = not get_moe_a2a_backend().is_none()
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -1020,6 +1047,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
                 swiglu_clamp_limit=shared_clamp_limit,
+                **({"tp_rank": 0, "tp_size": 1} if self.use_a2a else {}),
             )
         else:
             self.shared_expert = None
@@ -1152,7 +1180,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if self.tp_size > 1 and not use_reduce_scatter and not self.use_a2a:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
@@ -2187,6 +2215,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 )
 
                 dp_rank = get_attention_dp_rank()
+                # Attention-TP collectives need the local row count to be a
+                # multiple of attn_tp_size; pad the one-row-per-request mirror
+                # output with zero rows (trimmed before the final norm).
+                rows = hidden_states.shape[0]
+                pad = (-rows) % self.attn_tp_size
+                forward_batch.welm_mirror_rows = rows
+                if pad:
+                    hidden_states = torch.cat(
+                        [hidden_states, hidden_states.new_zeros((pad, *hidden_states.shape[1:]))]
+                    )
+                    residual = torch.cat(
+                        [residual, residual.new_zeros((pad, *residual.shape[1:]))]
+                    )
                 new_local_num_tokens = hidden_states.shape[0]
                 scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
                 if scale > 1:
@@ -2225,7 +2266,51 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     new_global_num_tokens,
                 )
 
-        if use_mmq_norm_after_attn:
+        if use_mmq_norm_after_attn and use_dp_layer_communicator and self.attn_tp_size > 1:
+            # o_proj does not reduce under DP attention; reduce inside the
+            # attention-TP group first (reduce-scatter when the MLP consumes
+            # scattered tokens, e.g. DeepEP), matching LayerCommunicator's
+            # tensor_split layout, then apply o_norm + residual + post-attn norm.
+            from sglang.srt.layers.dp_attention import (
+                attn_tp_all_reduce,
+                attn_tp_reduce_scatter_tensor,
+            )
+
+            full = hidden_states
+            if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+                hidden_states = full.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+                if full.shape[0] != 0:
+                    hidden_states = hidden_states.contiguous()
+                    attn_tp_reduce_scatter_tensor(hidden_states, full)
+                if residual is not None and residual.shape[0] == full.shape[0]:
+                    residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank].contiguous()
+            elif full.shape[0] != 0:
+                hidden_states = attn_tp_all_reduce(full)
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
+                    hidden_states,
+                    residual,
+                    self.self_attn.o_norm.weight,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.eps,
+                )
+            else:
+                hidden_states_fp32 = hidden_states.to(torch.float32)
+            if self.layer_scatter_modes.mlp_mode == ScatterMode.FULL:
+                # MoE over the whole TP group (no a2a backend): gather every
+                # DP replica's tokens; postprocess_layer scatters them back.
+                from sglang.srt.layers.dp_attention import (
+                    dp_gather_replicate,
+                    get_attention_dp_size,
+                    get_global_dp_buffer,
+                )
+
+                if get_attention_dp_size() != 1:
+                    local_hidden_states = hidden_states
+                    hidden_states = get_global_dp_buffer(_welm_get_tp_group())
+                    dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+                    hidden_states_fp32 = hidden_states.to(torch.float32)
+        elif use_mmq_norm_after_attn:
             hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
                 hidden_states,
                 residual,
@@ -2246,7 +2331,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
                 if get_attention_dp_size() != 1:
                     local_hidden_states = hidden_states
-                    hidden_states = get_global_dp_buffer()
+                    hidden_states = get_global_dp_buffer(_welm_get_tp_group())
                     dp_gather_partial(
                         hidden_states, local_hidden_states, forward_batch
                     )
@@ -2350,12 +2435,18 @@ class Qwen2MoeModel(nn.Module):
         self.scale_seq_times = getattr(config, "scale_seq_times", 0)
 
         if len(self.oe_vocab_sizes) > 0:
+            from sglang.srt.layers.welm_oe_host import HostOEEmbedding, host_dir
+
+            oe_dir = host_dir()
             self.oe_embed = nn.ModuleList(
                 [
-                    VocabParallelEmbedding(
+                    # WELM_OE_HOST_DIR: tables stay in host memory (no HBM).
+                    HostOEEmbedding(oe_dir, i, self.oe_vocab_sizes[i], self.oe_dim)
+                    if oe_dir
+                    else VocabParallelEmbedding(
                         self.oe_vocab_sizes[i],
                         self.oe_dim,
-                        enable_tp=not is_dp_attention_enabled(),
+                        **get_embedding_tp_kwargs(),
                     )
                     for i in range(len(self.oe_vocab_sizes))
                 ]
@@ -2374,7 +2465,7 @@ class Qwen2MoeModel(nn.Module):
                     VocabParallelEmbedding(
                         config.vocab_size,
                         config.hidden_size,
-                        enable_tp=not is_dp_attention_enabled(),
+                        **get_embedding_tp_kwargs(),
                     )
                     for _ in range(self.scale_seq_times)
                 ]
@@ -2387,7 +2478,7 @@ class Qwen2MoeModel(nn.Module):
                                 VocabParallelEmbedding(
                                     self.oe_vocab_sizes[j],
                                     self.oe_dim,
-                                    enable_tp=not is_dp_attention_enabled(),
+                                    **get_embedding_tp_kwargs(),
                                 )
                                 for j in range(len(self.oe_vocab_sizes))
                             ]
@@ -2411,7 +2502,7 @@ class Qwen2MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                **get_embedding_tp_kwargs(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -2543,6 +2634,7 @@ class Qwen2MoeModel(nn.Module):
         skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         _welm_start_dump_pass()
+        forward_batch.welm_mirror_rows = None
         if self.pp_group.is_first_rank:
             kv_mirror_states = _empty_welm_kv_mirror_states()
             if len(self.oe_grams) > 0:
@@ -2633,6 +2725,11 @@ class Qwen2MoeModel(nn.Module):
             return PPProxyTensors(proxy_tensors)
         else:
             pre_norm_hidden_states = None
+            mirror_rows = getattr(forward_batch, "welm_mirror_rows", None)
+            if mirror_rows is not None and hidden_states.shape[0] > mirror_rows:
+                hidden_states = hidden_states[:mirror_rows]
+                if residual is not None:
+                    residual = residual[:mirror_rows]
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     pre_norm_hidden_states = hidden_states
@@ -2687,6 +2784,16 @@ class Qwen2MoeModel(nn.Module):
 
 class WeLMV4MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    def get_attention_sliding_window_size(self):
+        """Window (exclusive of the query, FA convention) of the sliding layers;
+        only reported for the hybrid SWA KV pool (WELM_HYBRID_SWA=1)."""
+        if os.environ.get("WELM_HYBRID_SWA", "0") != "1":
+            return None
+        windows = getattr(self.config, "sliding_window_size_layerwise", None) or []
+        full = getattr(self.config, "max_position_embeddings", 1 << 30)
+        sw = [w for w in windows[: self.config.num_hidden_layers] if 0 < w < full]
+        return (min(sw) - 1) if sw else None
 
     def __init__(
         self,
@@ -2941,7 +3048,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 "hnorm",
             ]
 
+        from sglang.srt.layers.welm_oe_host import host_dir as _oe_host_dir
+
+        oe_on_host = _oe_host_dir() is not None
         for name, loaded_weight in weights:
+            if oe_on_host and ".oe_embed." in name:
+                # Served from WELM_OE_HOST_DIR (exported once per node).
+                continue
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
