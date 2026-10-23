@@ -384,7 +384,11 @@ def vllm_flash_attn_with_kvcache(
         block_table=page_table,
         cache_seqlens=cache_seqlens,
         softmax_scale=softmax_scale,
-        # max_seqlen_k=max_seqlen_k,
+        **(
+            {"max_seqlen_k": page_table.shape[1] * k_cache.shape[2]}
+            if _is_hcu and page_table is not None and k_cache.dim() == 4 and _vendor_pa_takes_max_len()
+            else {}
+        ),
         causal=causal,
         window_size=window_size,
         softcap=softcap,
@@ -426,7 +430,21 @@ def _hcu_paged_attention_covers(num_blocks, page_size, num_seqs, max_len):
     or > 8192 with num_blocks*block_size/num_seqs + 8192 and sizes the
     partition grid from that; tokens past it are silently dropped.
     """
+    if _vendor_pa_takes_max_len():
+        return True
     return (num_blocks * page_size) // num_seqs + 8192 >= max_len
+
+
+_vendor_pa_max_len = None
+
+
+def _vendor_pa_takes_max_len():
+    """The WeLM-patched vendor build (flash-attention-cutlass welm) honours the
+    caller's max_seq_len, so passing the page-table width covers every token."""
+    global _vendor_pa_max_len
+    if _vendor_pa_max_len is None:
+        _vendor_pa_max_len = _vendor_fa_has_welm_patches()
+    return _vendor_pa_max_len
 
 
 def _use_welm_decode_attention(
