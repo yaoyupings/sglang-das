@@ -377,7 +377,7 @@ class DataParallelController:
                 ),
             ]
         )
-        self._request_dispatcher.add_fallback_fn(self.send_control_message)
+        self._request_dispatcher.add_fallback_fn(self._control_message_with_affinity_reset)
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -816,6 +816,14 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    def _control_message_with_affinity_reset(self, req):
+        # flush_cache empties every rank's radix cache: the prefix -> rank map
+        # (and its popularity counts) no longer describes any cache, so drop it.
+        if type(req).__name__ == "FlushCacheReqInput":
+            self._prefix_owner.clear()
+            self._affinity_dispatches = 0
+        return self.send_control_message(req)
+
     _AFFINITY_DEPTHS = (2048, 4096, 6144, 8192, 12288)
     _AFFINITY_MAX_KEYS = 200_000
 
@@ -852,6 +860,14 @@ class DataParallelController:
         for k in keys:
             e = owner.get(k)
             owner[k] = (target, 1) if e is None else (e[0], e[1] + 1)
+        # Halve all counts every SGLANG_DP_AFFINITY_DECAY dispatches: "popular"
+        # means shared by many recent requests, independent of how long the
+        # server has run or how often the same workload was replayed.
+        self._affinity_dispatches = getattr(self, "_affinity_dispatches", 0) + 1
+        if self._affinity_dispatches >= envs.SGLANG_DP_AFFINITY_DECAY.get():
+            self._affinity_dispatches = 0
+            for k, (r, c) in list(owner.items()):
+                owner[k] = (r, c // 2)
         sock_send(self.workers[target], req)
 
     def event_loop(self):
