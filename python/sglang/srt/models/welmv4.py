@@ -132,6 +132,9 @@ def _welm_fused_kv_store_buffers(forward_batch, layer_id, dtype):
 # Run the shared expert as an extra (always selected, weight 1) expert inside
 # the routed fused MoE instead of three separate GEMM/activation kernels.
 _WELM_FUSE_SHARED_EXPERT = get_bool_env_var("WELM_FUSE_SHARED_EXPERT", "true")
+# Also fuse when routed experts are channel-fp8: the shared expert is quantized
+# per output channel into the extra slot at load time.
+_WELM_FUSE_SHARED_FP8 = get_bool_env_var("WELM_FUSE_SHARED_FP8", "false")
 # Append the head-wise attention gate rows to the qkv projection (one GEMM).
 _WELM_MERGE_GATE_PROJ = get_bool_env_var("WELM_MERGE_GATE_PROJ", "true")
 _WELM_DUMP_PROCESS_DIR = None
@@ -192,6 +195,27 @@ def _welm_should_dump_layer(layer_idx: int) -> bool:
     if not layer_idxs:
         return True
     return str(layer_idx) in {x.strip() for x in layer_idxs.split(",") if x.strip()}
+
+
+_WELM_QKV_CAP = os.environ.get("WELM_QKV_CAP", "")
+_welm_qkv_cap_n: Dict[int, int] = {}
+
+
+def _welm_qkv_capture(attn, q, k, v, sinks, forward_batch):
+    """Save post-rope q/k/v of an extend batch (first 2 per layer) for offline attention-quant studies."""
+    lid = getattr(attn, "layer_idx", -1)
+    n = _welm_qkv_cap_n.get(lid, 0)
+    if n >= 2 or torch.cuda.is_current_stream_capturing() or torch.distributed.get_rank() != 0:
+        return
+    _welm_qkv_cap_n[lid] = n + 1
+    os.makedirs(_WELM_QKV_CAP, exist_ok=True)
+    torch.save({
+        "q": q.detach().cpu(), "k": k.detach().cpu(), "v": v.detach().cpu(),
+        "sinks": None if sinks is None else sinks.detach().float().cpu(),
+        "window": getattr(attn, "sliding_window_size", -1),
+        "seq_lens": forward_batch.extend_seq_lens_cpu, "prefix_lens": forward_batch.extend_prefix_lens_cpu,
+        "head_dim": attn.head_dim, "scaling": attn.scaling,
+    }, f"{_WELM_QKV_CAP}/L{lid:02d}_{n}.pt")
 
 
 def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -319,9 +343,69 @@ def welm_embed_with_oe(
     return (base + emb_new) / 2.0
 
 
+# Hybrid dense fp8: prefill-sized GEMMs (M >= WELM_DENSE_FP8_MIN_M tokens) on bf16
+# attention weights run as dynamic per-token x per-channel fp8 through lightop
+# hipBLASLt (1.4-1.6x at M >= 512); decode-sized ones stay bf16 (fp8 has a ~35 us
+# floor there). Weights are quantized lazily from the bf16 copy. 0 = off.
+_WELM_DENSE_FP8_MIN_M = int(os.environ.get("WELM_DENSE_FP8_MIN_M", "0"))
+_welm_fp8_wcache: Dict[Tuple[int, Tuple[int, ...]], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _welm_dense_fp8_ok(x: torch.Tensor, w: torch.Tensor) -> bool:
+    return (
+        _WELM_DENSE_FP8_MIN_M > 0
+        and x.dim() == 2
+        and x.shape[0] >= _WELM_DENSE_FP8_MIN_M
+        and x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _welm_fp8_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    from lightop.gemm_ops import (
+        hipblaslt_w8a8_channelwise_gemm,
+        hipblaslt_w8a8_channelwise_gemm_kme,
+    )
+    from lightop.quant.fp8 import per_token_quant_fp8
+
+    key = (w.data_ptr(), tuple(w.shape))
+    ent = _welm_fp8_wcache.get(key)
+    if ent is None:
+        ws = (w.float().abs().amax(1, keepdim=True) / 448.0).clamp(min=1e-8)
+        ent = ((w.float() / ws).to(torch.float8_e4m3fn).contiguous(), ws.contiguous())
+        _welm_fp8_wcache[key] = ent
+    w8, ws = ent
+    q, xs = per_token_quant_fp8(x.contiguous(), dtype=torch.float8_e4m3fn)
+    m, k = q.shape
+    n = w8.shape[0]
+    try:
+        out = hipblaslt_w8a8_channelwise_gemm(q, w8, xs, ws, m, n, k, "NT", x.dtype, None)[1]
+    except RuntimeError:
+        out = hipblaslt_w8a8_channelwise_gemm_kme(q, w8, xs, ws, m, n, k, "NT", x.dtype, None)[1]
+    return out.view(m, n)  # lightop returns [1, M, N]
+
+
+class _WelmDenseFp8Method:
+    """Wraps a bf16 linear method: fp8 for prefill-sized inputs, original otherwise."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def apply(self, layer, x, bias=None, **kw):
+        if bias is None and not kw and _welm_dense_fp8_ok(x, layer.weight):
+            return _welm_fp8_linear(x, layer.weight)
+        return self.inner.apply(layer, x, bias=bias, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
 def _welm_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     from sglang.srt.layers.welmv4_fast_op import skinny_gemm, skinny_gemm_supported
 
+    if _welm_dense_fp8_ok(x, w):
+        return _welm_fp8_linear(x, w)
     if x.dim() == 2 and skinny_gemm_supported(x, w):
         return skinny_gemm(x, w)
     return F.linear(x, w)
@@ -1001,7 +1085,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.fuse_shared_expert = (
             _WELM_FUSE_SHARED_EXPERT
-            and quant_config is None
+            and (quant_config is None or _WELM_FUSE_SHARED_FP8)
             and config.moe_routing_type == "expert_bias"
             and config.shared_expert_intermediate_size == config.moe_intermediate_size
             and shared_clamp_limit == moe_clamp_limit
@@ -1093,8 +1177,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             down = self.shared_expert.down_proj.weight
             assert w13.shape[1:] == gate_up.shape, (w13.shape, gate_up.shape)
             assert w2.shape[1:] == down.shape, (w2.shape, down.shape)
-            w13.data[self.num_experts].copy_(gate_up.data)
-            w2.data[self.num_experts].copy_(down.data)
+            if w13.dtype == torch.float8_e4m3fn:
+                # channel-fp8 experts: quantize the shared slot the same way
+                for w, src, scale in (
+                    (w13, gate_up, self.experts.w13_weight_scale),
+                    (w2, down, self.experts.w2_weight_scale),
+                ):
+                    s = src.data.float().abs().amax(-1, keepdim=True) / 448.0
+                    s = s.clamp(min=1e-12)
+                    w.data[self.num_experts].copy_(
+                        (src.data.float() / s).clamp(-448.0, 448.0).to(w.dtype)
+                    )
+                    scale.data[self.num_experts].copy_(s.view_as(scale.data[self.num_experts]))
+            else:
+                w13.data[self.num_experts].copy_(gate_up.data)
+                w2.data[self.num_experts].copy_(down.data)
 
     def forward(
         self,
@@ -1853,6 +1950,8 @@ class Qwen2MoeAttention(nn.Module):
             attn_kwargs["sinks"] = attn_sink
         if not attn_kwargs_save:
             attn_kwargs["save_kv_cache"] = False
+        if _WELM_QKV_CAP and forward_batch.forward_mode.is_extend() and q.shape[0] >= 2048:
+            _welm_qkv_capture(self, q, k, v, attn_kwargs.get("sinks"), forward_batch)
         if q_prescaled:
             _fa_iface.WELM_Q_PRESCALED = True
             try:
@@ -1913,6 +2012,13 @@ class Qwen2MoeAttention(nn.Module):
             self.qkvgm_weight = merged
 
     def post_load_weights(self):
+        if (
+            _WELM_DENSE_FP8_MIN_M > 0
+            and getattr(self.o_proj, "weight", None) is not None
+            and self.o_proj.weight.dtype == torch.bfloat16
+            and not isinstance(self.o_proj.quant_method, _WelmDenseFp8Method)
+        ):
+            self.o_proj.quant_method = _WelmDenseFp8Method(self.o_proj.quant_method)
         if self.attn_sink is not None:
             sink = self.attn_sink.data.to(torch.bfloat16)
             local_num_heads = self.num_heads

@@ -20,6 +20,46 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
+def _seed_welm_ngram_ring(batch: ScheduleBatch) -> None:
+    """Seed WeLM's on-device OE n-gram ring for transferred requests.
+
+    The prefill server wrote the ring on its own device; decode reads the
+    predecessors of each decode input from it. Write the last SLOTS tokens
+    of every request at ``position % SLOTS`` (position = index in the
+    sequence), exactly what a local prefill + first sample would leave.
+    """
+    try:
+        from sglang.srt.models.welmv4 import WelmSpecNgramRing, welm_use_device_ngram
+    except ImportError:
+        return
+    if WelmSpecNgramRing.buf is None or not welm_use_device_ngram():
+        return
+    slots = WelmSpecNgramRing.SLOTS
+    rows, cols, vals = [], [], []
+    for req in batch.reqs:
+        total = len(req.origin_input_ids) + len(req.output_ids)
+        n = min(slots, total)
+        n_out = min(n, len(req.output_ids))
+        tail = list(req.origin_input_ids[len(req.origin_input_ids) - (n - n_out) :]) if n > n_out else []
+        tail += list(req.output_ids[len(req.output_ids) - n_out :]) if n_out else []
+        for j, tok in enumerate(tail):
+            pos = total - n + j
+            rows.append(req.req_pool_idx)
+            cols.append(pos % slots)
+            vals.append(tok)
+    if not rows:
+        return
+    ring = WelmSpecNgramRing.buf
+    pin = is_pin_memory_available(batch.device)
+    idx = torch.tensor([rows, cols], dtype=torch.int64, pin_memory=pin).to(
+        ring.device, non_blocking=True
+    )
+    v = torch.tensor(vals, dtype=torch.int64, pin_memory=pin).to(
+        ring.device, non_blocking=True
+    )
+    ring[idx[0], idx[1]] = v
+
+
 class ScheduleBatchDisaggregationDecodeMixin:
 
     def prepare_for_prebuilt(self: ScheduleBatch):
@@ -154,6 +194,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
             last_tokens_tensor = torch.tensor(
                 last_tokens, dtype=torch.int64, device=self.device
             )
+
+        _seed_welm_ngram_ring(self)
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,

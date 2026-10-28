@@ -63,7 +63,10 @@ def available() -> bool:
         return False
 
 
-@triton.jit
+# Mixed steps call these with arbitrary row counts and row-sliced tensors;
+# without do_not_specialize every new B / alignment combo JIT-compiles
+# (~1.6 s stall) at serving time.
+@triton.jit(do_not_specialize=["BT", "SEQK", "B", "stride_bt"])
 def _dedup_group_kernel(
     BT, SEQK, CNT, BT_V, SEQ_V, MEM_V, MAP, B,
     stride_bt, stride_map,
@@ -105,7 +108,7 @@ def _dedup_group_kernel(
     tl.store(MAP + r * stride_map + c, mp, mask=in_b)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SEQK", "SINKS", "OUT", "stride_ob"])
 def _dedup_merge_kernel(
     BUF_F, BUF_H, MAP, SEQ_V, SEQK, SINKS, OUT,
     stride_map, stride_ob, stride_oh,

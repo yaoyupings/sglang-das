@@ -364,6 +364,31 @@ _MIXED_CHUNK_MIN_TOKENS = int(os.environ.get("SGLANG_MIXED_CHUNK_MIN_TOKENS", "0
 # Token budget for admitting short waiting requests ahead of an in-progress
 # chunked prefill (0 disables).
 _SHORT_FIRST_TOKENS = int(os.environ.get("SGLANG_SHORT_FIRST_TOKENS", "0"))
+# In-flight prefix hold (0 disables): defer a waiting request whose prompt shares
+# >= cached + MIN_GAIN tokens with a request already scheduled for prefill
+# (its KV is not in the radix cache yet); held at most HOLD_MS.
+_INFLIGHT_BLK = int(os.environ.get("SGLANG_INFLIGHT_HOLD_BLK", "0"))
+_INFLIGHT_MIN_GAIN = int(os.environ.get("SGLANG_INFLIGHT_HOLD_MIN_GAIN", "2048"))
+# Counted in prefill-scheduling iterations (wall time would desync TP ranks).
+_INFLIGHT_HOLD_IT = int(os.environ.get("SGLANG_INFLIGHT_HOLD_IT", "12"))
+_INFLIGHT_TTL_IT = 4 * _INFLIGHT_HOLD_IT
+
+
+def _pfx_chain(req):
+    h = getattr(req, "_pfx_chain", None)
+    if h is None:
+        ids = req.origin_input_ids; B = _INFLIGHT_BLK; h = []; x = 0
+        for k in range(1, len(ids) // B + 1):
+            x = hash((x, tuple(ids[(k - 1) * B:k * B]))); h.append(x)
+        req._pfx_chain = h
+    return h
+# TPOT guard (off by default): cap/defer prefill so no decode row's projected
+# TPOT exceeds SGLANG_TPOT_GUARD_MS. Cost model: a step with x new prefill
+# tokens takes DEC_MS + x * US_PER_TOK; later steps take DEC_MS each.
+_TPOT_GUARD_MS = float(os.environ.get("SGLANG_TPOT_GUARD_MS", "0"))
+_TPOT_GUARD_DEC_MS = float(os.environ.get("SGLANG_TPOT_GUARD_DEC_MS", "22"))
+_TPOT_GUARD_US_PER_TOK = float(os.environ.get("SGLANG_TPOT_GUARD_US_PER_TOK", "19"))
+_TPOT_GUARD_MIN_TOKENS = int(os.environ.get("SGLANG_TPOT_GUARD_MIN_TOKENS", "1024"))
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -1257,6 +1282,38 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    _tpot_guard_tokens = None
+
+    def _tpot_guard_defer(self, running_batch) -> bool:
+        """Set the per-step prefill token cap from the decode rows' TPOT slack;
+        True = skip prefill this step."""
+        self._tpot_guard_tokens = None
+        if _TPOT_GUARD_MS <= 0 or running_batch is None or not running_batch.reqs:
+            return False
+        if not self.waiting_queue and self.chunked_req is None:
+            return False
+        now = time.perf_counter()
+        dec = _TPOT_GUARD_DEC_MS / 1e3
+        slack = None
+        for req in running_batch.reqs:
+            t0 = req.time_stats.prefill_finished_time
+            N = req.sampling_params.max_new_tokens
+            n = len(req.output_ids)
+            if not t0 or N is None or N < 2 or n >= N:
+                continue
+            # time left for this step after the remaining decode-only steps
+            s_ = _TPOT_GUARD_MS / 1e3 * (N - 1) - (now - t0) - (N - n - 1) * dec - dec
+            if s_ < 0:
+                continue  # cannot meet the target even without prefill
+            slack = s_ if slack is None else min(slack, s_)
+        if slack is None:
+            return False
+        cap = int(slack * 1e6 / _TPOT_GUARD_US_PER_TOK)
+        if cap < _TPOT_GUARD_MIN_TOKENS:
+            return True
+        self._tpot_guard_tokens = cap
+        return False
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -4048,6 +4105,8 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
+        elif self._tpot_guard_defer(running_batch):
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -4198,6 +4257,8 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        if self._tpot_guard_tokens is not None and chunked_prefill_size and chunked_prefill_size > 0:
+            chunked_prefill_size = min(chunked_prefill_size, self._tpot_guard_tokens)
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
@@ -4291,9 +4352,36 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
+        now_ih = 0
+        if _INFLIGHT_BLK > 0:
+            ih = getattr(self, "_inflight_pfx", None)
+            if ih is None:
+                ih = self._inflight_pfx = {}
+                self._inflight_held = 0
+                self._inflight_it = 0
+            self._inflight_it += 1
+            now_ih = self._inflight_it
+            if len(ih) > 4096 or (ih and now_ih - next(iter(ih.values())) > _INFLIGHT_TTL_IT):
+                for kk in [kk for kk, tt in ih.items() if now_ih - tt > _INFLIGHT_TTL_IT]:
+                    del ih[kk]
         for req in self.waiting_queue:
             if req in pre_admitted:
                 continue
+            if _INFLIGHT_BLK > 0 and self._inflight_pfx:
+                t0 = getattr(req, "_ih_t0", None)
+                if t0 is None or now_ih - t0 < _INFLIGHT_HOLD_IT:
+                    ch = _pfx_chain(req); ih = self._inflight_pfx; d = 0
+                    for k in range(len(ch) - 1, -1, -1):
+                        if ch[k] in ih:
+                            d = (k + 1) * _INFLIGHT_BLK; break
+                    if d > 0:
+                        req.init_next_round_input(self.tree_cache)
+                        if d >= len(req.prefix_indices) + _INFLIGHT_MIN_GAIN:
+                            if t0 is None:
+                                req._ih_t0 = now_ih; self._inflight_held += 1
+                                if self._inflight_held % 50 == 1:
+                                    logger.info(f"inflight-hold: held {self._inflight_held} reqs")
+                            continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4405,6 +4493,12 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if _INFLIGHT_BLK > 0:
+            for r in can_run_list:
+                if not getattr(r, "_ih_rec", False):
+                    r._ih_rec = True
+                    for x in _pfx_chain(r):
+                        self._inflight_pfx[x] = now_ih
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)

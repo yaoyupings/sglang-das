@@ -200,6 +200,16 @@ _WELM_DEDUP_DECODE = __import__("os").environ.get("WELM_DEDUP_DECODE", "true").l
 _WELM_DEDUP_MIN_BS = int(__import__("os").environ.get("WELM_DEDUP_MIN_BS", "4"))
 _WELM_DEDUP_FIRST_LAYER = None
 _WELM_DEDUP_MIXED = __import__("os").environ.get("WELM_DEDUP_MIXED", "true").lower() in ("1", "true")
+_WELM_DEDUP_DEBUG = __import__("collections").Counter() if __import__("os").environ.get("WELM_DEDUP_DEBUG") else None
+
+
+def _welm_dedup_note(reason):
+    if _WELM_DEDUP_DEBUG is None:
+        return
+    _WELM_DEDUP_DEBUG[reason] += 1
+    tot = sum(_WELM_DEDUP_DEBUG.values())
+    if tot % 2000 == 0:
+        print("WELM_DEDUP_DEBUG", dict(_WELM_DEDUP_DEBUG), flush=True)
 
 
 def _welm_dedup_decode_state(
@@ -207,17 +217,21 @@ def _welm_dedup_decode_state(
     mixed=False,
 ):
     """Shared-prefix grouping for full-attention decode rows (once per forward)."""
+    tag = "mixed" if mixed else "dec"
     if not _WELM_DEDUP_DECODE or excluded:
+        _welm_dedup_note(tag + ":excluded")
         return None
     if not (forward_batch.forward_mode.is_decode() or mixed):
         return None
     if window_size is not None and tuple(window_size) != (-1, -1):
+        _welm_dedup_note(tag + ":swa")
         return None
     from sglang.srt.layers.attention import flashattention_interface as _fi
     from sglang.srt.layers.attention import welm_dedup_decode as _dd
 
     B = q.shape[0]
     if not (_WELM_DEDUP_MIN_BS <= B <= _dd.MAX_B) or B != page_table.shape[0]:
+        _welm_dedup_note(f"{tag}:bs({B},{page_table.shape[0]})" if B >= _WELM_DEDUP_MIN_BS else tag + ":bs<min")
         return None
     if (
         q.dtype != torch.bfloat16
@@ -228,11 +242,14 @@ def _welm_dedup_decode_state(
         or key_cache.shape[2] != 64
         or key_cache.dtype != torch.bfloat16
     ):
+        _welm_dedup_note(f"{tag}:shape{tuple(q.shape[1:])}{tuple(key_cache.shape[1:])}")
         return None
-    if not (_fi.WELM_Q_PRESCALED or abs(layer.scaling - 256**-0.5) < 1e-7):
+    if not (mixed or _fi.WELM_Q_PRESCALED or abs(layer.scaling - 256**-0.5) < 1e-7):
         return None
     if not _dd.available():
+        _welm_dedup_note(tag + ":unavailable")
         return None
+    _welm_dedup_note(tag + ":ok")
     # Group once per forward, at the first full-attention layer: layers run
     # in order, so the grouping kernels are also captured into decode graphs
     # (a cache keyed on Python objects would survive capture warmup).
@@ -245,6 +262,151 @@ def _welm_dedup_decode_state(
             key_cache.shape[2], B,
         )
     return _dd.get_prepared(page_table.shape[1] * key_cache.shape[2], key_cache.shape[2], B, q.device)
+
+
+_WELM_FP8_PREFILL_MODE = __import__("os").environ.get("WELM_FP8_PREFILL_ATTN", "false").lower()
+_WELM_FP8_PREFILL = _WELM_FP8_PREFILL_MODE in ("1", "true", "paged")
+# "paged": patched fa_src fp8 prefix-prefill kernel (P pre-scaled by 2^8 before e4m3) on
+# per-tensor fp8 copies of the batch's KV pages; module dir from WELM_FA8_MODDIR.
+_WELM_FP8_PAGED = _WELM_FP8_PREFILL_MODE == "paged"
+_WELM_FP8_MIN_Q = int(__import__("os").environ.get("WELM_FP8_PREFILL_MIN_Q", "1024"))
+_welm_hg_mod = []
+_WELM_QK_C = {}
+_WELM_FP8_TRITON = __import__("os").environ.get("WELM_FP8_TRITON_QUANT", "1") == "1"
+_welm_kvq_mod = []
+
+
+def _welm_kvq():
+    if not _welm_kvq_mod:
+        import sys
+        sys.path.insert(0, "/root/welm_opt/fa8")
+        import kvq
+        _welm_kvq_mod.append(kvq)
+    return _welm_kvq_mod[0]
+_WELM_QK_MARGIN = float(__import__("os").environ.get("WELM_FP8_QK_MARGIN", "8"))
+_WELM_FP8_PREFILL_CHECK = [int(__import__("os").environ.get("WELM_FP8_PREFILL_CHECK", "0"))]
+# bf16 non-paged varlen prefill on gathered KV (same math, ~15% faster than the paged kernel)
+_WELM_VARLEN_PREFILL = __import__("os").environ.get("WELM_VARLEN_PREFILL_ATTN", "false").lower() in ("1", "true")
+
+
+def _welm_q8(x):
+    s = (x.abs().amax().float() / 448.0).clamp(min=1e-8)
+    return (x.float() / s).to(torch.float8_e4m3fn), s.view(1)
+
+
+def _welm_fp8_prefill_ok(q, key_cache, window_size, total_k):
+    return (
+        (_WELM_FP8_PREFILL or _WELM_VARLEN_PREFILL)
+        and q.dtype == torch.bfloat16
+        and key_cache.dtype == torch.bfloat16
+        and tuple(window_size) == (-1, -1)
+        and isinstance(total_k, int)
+        and total_k > 0
+        and q.shape[-1] == 256
+        and (not _WELM_FP8_PAGED or q.shape[0] >= _WELM_FP8_MIN_Q)
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _welm_hg():
+    if not _welm_hg_mod:
+        import os, sys
+        sys.path.insert(0, os.environ.get("WELM_FA8_MODDIR", "/root/welm_opt/fa8/mod_pshift"))
+        import flash_attn_hg_cuda
+        _welm_hg_mod.append(flash_attn_hg_cuda)
+    return _welm_hg_mod[0]
+
+
+def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
+                            seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks):
+    """fp8 prefix prefill on the legacy layout: gather this batch's KV pages,
+    quantize per-tensor (valid tokens only) to bshd e4m3 pages, run the fa_src
+    fp8 d256 prefix-prefill kernel. Output bf16 [T, H, D]."""
+    hg = _welm_hg()
+    B = seqused_k.shape[0]
+    HK, Pg, D = key_cache.shape[1], key_cache.shape[2], key_cache.shape[3]
+    maxp = min(page_table.shape[1], (int(max_seqlen_k) + Pg - 1) // Pg)
+    if _WELM_FP8_TRITON:
+        # fused gather + per-tensor e4m3 quant (welm_opt/fa8/kvq.py)
+        kvq = _welm_kvq()
+        k8, v8, amax = kvq.gather_quant_kv(key_cache, value_cache, page_table, seqused_k, maxp)
+        ks = amax[0:1] / 448.0
+        vs = amax[1:2] / 448.0
+    else:
+        idx = page_table[:, :maxp].reshape(-1).long()
+        kg = key_cache.index_select(0, idx)          # [B*maxp, HK, P, D]
+        vg = value_cache.index_select(0, idx)        # [B*maxp, HK, D, P]
+        tok = torch.arange(maxp * Pg, device=q.device, dtype=torch.int32).view(1, maxp, Pg)
+        valid = (tok < seqused_k.view(B, 1, 1)).view(B * maxp, 1, Pg)
+        ks = (kg.abs().masked_fill(~valid[..., None], 0).amax().float() / 448.0).clamp(min=1e-8)
+        vs = (vg.abs().masked_fill(~valid[:, :, None, :], 0).amax().float() / 448.0).clamp(min=1e-8)
+        k8 = (kg.float() / ks).to(torch.float8_e4m3fn).permute(0, 2, 1, 3).contiguous()
+        v8 = (vg.float() / vs).to(torch.float8_e4m3fn).permute(0, 3, 1, 2).contiguous()
+    bt = torch.arange(B * maxp, device=q.device, dtype=torch.int32).view(B, maxp)
+    # Host-side q*k descale C, calibrated once per layer (keyed by its KV buffer):
+    # quantize q against C/ks on device so softmax_scale*C is a host constant
+    # and no per-call sync is needed. q8 headroom = margin, clamped.
+    ck = key_cache.data_ptr()
+    C = _WELM_QK_C.get(ck)
+    if C is None:
+        C = float((q.abs().amax().float() / 448.0 * ks.view(-1)[0]).item()) * _WELM_QK_MARGIN
+        _WELM_QK_C[ck] = C
+    qs = C / ks.view(1)
+    if _WELM_FP8_TRITON:
+        q8 = kvq.quant_q(q, amax, C)
+    else:
+        q8 = (q.float() / qs).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+    hg.hg_prefix_prefill_varlen_fwd(
+        q8, k8, v8, out, cu_seqlens_q, None, seqused_k, None, bt,
+        int(max_seqlen_q), int(max_seqlen_k), 0.0, float(scale) * C, False, True,
+        -1, -1, 0.0, False, 1, qs.view(1), ks.view(1), vs.view(1),
+        None if sinks is None else sinks.to(torch.bfloat16).contiguous(), True,
+    )
+    # fa_src is built with FP8_NO_SCALES: descale ptrs are ignored, so q*k
+    # descale is folded into softmax_scale above and v descale applied here.
+    return out.mul_(vs.to(out.dtype))
+
+
+def _welm_fp8_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
+                      seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks, total_k):
+    if _WELM_FP8_PAGED:
+        return _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
+                                       seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks)
+    """Prefill attention with the FA HG fp8 d256 varlen kernel (~2x the bf16
+    paged kernel): gather the legacy-layout paged KV to contiguous bf16, then
+    per-tensor dynamic e4m3 for q/k/v. Output bf16 [T, H, D]."""
+    from flash_attn.flash_attn_interface import flash_attn_cuda
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa
+
+    HK, D = key_cache.shape[1], key_cache.shape[3]
+    ws = max(total_k, 256 * 1024)  # vendor minimum workspace (smaller can fault)
+    kt = torch.empty((ws, HK, D), device=q.device, dtype=q.dtype)
+    vt = torch.empty_like(kt)
+    cu_k = torch.empty_like(cu_seqlens_q)
+    flash_attn_cuda.pagedkv_to_contiguouskv(
+        kt, vt, key_cache, value_cache, page_table, seqused_k, cu_k, max_seqlen_k, 0
+    )
+    B = seqused_k.shape[0]
+    if not _WELM_FP8_PREFILL:
+        o = _fa(
+            q, kt[:total_k], vt[:total_k], cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, softmax_scale=scale,
+            causal=True, s_aux=sinks,
+        )
+        return o[0] if isinstance(o, tuple) else o
+    q8, qs = _welm_q8(q)
+    k8, ks = _welm_q8(kt[:total_k])
+    v8, vs = _welm_q8(vt[:total_k])
+    o = _fa(
+        q8, k8, v8, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_k,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, softmax_scale=scale,
+        causal=True, s_aux=sinks,
+        q_descale=qs.expand(B, HK).contiguous(),
+        k_descale=ks.expand(B, HK).contiguous(),
+        v_descale=vs.expand(B, HK).contiguous(),
+    )
+    return o[0] if isinstance(o, tuple) else o
 
 
 def _hcu_mixed_decode_rows(forward_batch) -> int:
@@ -1342,7 +1504,19 @@ class FlashAttentionBackend(AttentionBackend):
                     [int(x) for x in forward_batch.extend_seq_lens_cpu[:n_pre]],
                     [int(x) for x in seq_lens_cpu[:n_pre].tolist()],
                 )
-            pre = vllm_flash_attn_varlen_func(
+            total_k = int(seq_lens_cpu[:n_pre].sum()) if seq_lens_cpu is not None else None
+            pre8 = None
+            if _welm_fp8_prefill_ok(q2, key_cache, window_size, total_k):
+                pre8 = _welm_fp8_prefill(
+                    q2[:t_pre], key_cache, value_cache, page_table[:n_pre],
+                    cu_seqlens_q[: n_pre + 1], cache_seqlens[:n_pre], max_seqlen_q,
+                    metadata.max_seq_len_k or page_table.shape[1] * self.page_size,
+                    layer.scaling, sinks, total_k,
+                )
+            if pre8 is not None and _WELM_FP8_PREFILL_CHECK[0] <= 0:
+                pre = pre8
+            else:
+              pre = vllm_flash_attn_varlen_func(
                 q=q2[:t_pre],
                 k=key_cache,
                 v=value_cache,
@@ -1367,25 +1541,37 @@ class FlashAttentionBackend(AttentionBackend):
                 total_k_hint=(
                     int(seq_lens_cpu[:n_pre].sum()) if seq_lens_cpu is not None else None
                 ),
-            )
+              )
+              if pre8 is not None:
+                  _WELM_FP8_PREFILL_CHECK[0] -= 1
+                  ref = pre.view(t_pre, H, layer.v_head_dim).float()
+                  err = ((pre8.float() - ref).norm() / ref.norm()).item()
+                  print(f"WELM_FP8_PREFILL_CHECK layer {layer.layer_id} t={t_pre} k={total_k} relerr={err:.4f}", flush=True)
             if pre.data_ptr() != out.data_ptr():
                 out[:t_pre].copy_(pre.view(t_pre, H, layer.v_head_dim))
         dedup = None
+        _welm_dedup_note("mixed:enter")
         if _WELM_DEDUP_MIXED:
             from sglang.srt.layers.attention import flashattention_interface as _fi
 
             # The paged kernel prescale (WELM_Q_PRESCALED) does not apply to
             # extend batches; the dedup kernel needs the default scale.
-            if abs(layer.scaling - layer.head_dim**-0.5) < 1e-7:
-                dedup = _welm_dedup_decode_state(
-                    forward_batch, q2[t_pre:], key_cache, page_table[n_pre:],
-                    cache_seqlens[n_pre:], layer, window_size, False, mixed=True,
-                )
+            # extend batches are not prescaled (WELM_Q_PRESCALED is decode
+            # only); fold a non-default softmax scale (yarn mscale) into the
+            # few decode rows here instead.
+            q_dec = q2[t_pre:]
+            q_ratio = layer.scaling / layer.head_dim**-0.5
+            dedup = _welm_dedup_decode_state(
+                forward_batch, q_dec, key_cache, page_table[n_pre:],
+                cache_seqlens[n_pre:], layer, window_size, False, mixed=True,
+            )
+            if dedup is not None and abs(q_ratio - 1.0) > 1e-7:
+                q_dec = q_dec * q_ratio
         if dedup is not None:
             from sglang.srt.layers.attention import welm_dedup_decode
 
             welm_dedup_decode.attend(
-                q2[t_pre:], key_cache, value_cache, cache_seqlens[n_pre:], dedup,
+                q_dec, key_cache, value_cache, cache_seqlens[n_pre:], dedup,
                 sinks=sinks, out=out[t_pre:],
             )
             return out
@@ -1791,6 +1977,43 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_seqlens, max_seqlen_q, metadata, layer, window_size,
                     kwargs.get("sinks"), forward_batch, _fa_out,
                 )
+            elif (
+                self._use_hcu_legacy_layout
+                and max_seqlen_q > 1
+                and causal
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and cu_seqlens_q is metadata.cu_seqlens_q
+                and not use_cascade_attn
+                and not use_local_attn
+                and not layer.is_cross_attention
+                and self.attn_cp_size == 1
+                and _welm_fp8_prefill_ok(q, key_cache, window_size, forward_batch.seq_lens_sum)
+            ):
+                _q3 = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                _mk = metadata.max_seq_len_k or page_table.shape[1] * self.page_size
+                result = _welm_fp8_prefill(
+                    _q3, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens,
+                    max_seqlen_q, _mk, layer.scaling, kwargs.get("sinks"),
+                    forward_batch.seq_lens_sum,
+                )
+                if _WELM_FP8_PREFILL_CHECK[0] > 0:
+                    _WELM_FP8_PREFILL_CHECK[0] -= 1
+                    ref = vllm_flash_attn_varlen_func(
+                        q=_q3, k=key_cache, v=value_cache, cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q, seqused_k=cache_seqlens, max_seqlen_k=_mk,
+                        softmax_scale=layer.scaling, causal=True, window_size=window_size,
+                        block_table=page_table, fa_version=2, q_descale=None,
+                        k_descale=None, v_descale=None, layout="legacy_bhsd",
+                        sinks=kwargs.get("sinks"), total_k_hint=forward_batch.seq_lens_sum,
+                    )
+                    ref = ref.view(result.shape).float()
+                    _n = int(cu_seqlens_q[-1])
+                    err = ((result[:_n].float() - ref[:_n]).norm() / ref[:_n].norm()).item()
+                    print(f"WELM_FP8_PREFILL_CHECK extend layer {layer.layer_id} t={_n} k={forward_batch.seq_lens_sum} relerr={err:.4f}", flush=True)
+                    result = ref.to(_q3.dtype)
+                if _fa_out is not None:
+                    _fa_out.copy_(result.view_as(_fa_out))
+                    result = _fa_out
             elif self._use_hcu_legacy_layout and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

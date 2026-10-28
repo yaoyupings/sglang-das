@@ -5076,5 +5076,15 @@ def init_cublas():
     device = "cuda"
     a = torch.ones((16, 16), dtype=dtype, device=device)
     b = torch.ones((16, 16), dtype=dtype, device=device)
-    c = a @ b
-    return c
+    # WELM: rocBLAS/Tensile init on HCU flakes when many ranks start at once; retry
+    import time as _t
+    for _i in range(8):
+        try:
+            c = a @ b
+            torch.cuda.synchronize()
+            return c
+        except RuntimeError as e:
+            if _i == 7:
+                raise
+            logger.warning(f"init_cublas retry {_i}: {str(e)[:80]}")
+            _t.sleep(1.0 + _i)

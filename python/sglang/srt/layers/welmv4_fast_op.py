@@ -696,6 +696,29 @@ register_skinny_cfg(
         (1 << 30, 128, 128, 64, 8),
     ],
 )
+# lm_head per TP2 rank (155648 / 2 = 77824): rocBLAS 1.07 ms at M<=128 and
+# 2-30 ms above; this is 3-6x faster at every M (tuned 2026-10-28, lmh/tune.py).
+if os.environ.get("WELM_SKINNY_TP2_LMH", "1") == "1":
+  register_skinny_cfg(
+    77824,
+    2048,
+    [
+        (1, 16, 64, 128, 2),
+        (16, 16, 32, 256, 1),
+        (32, 32, 128, 128, 2),
+        (64, 64, 128, 128, 4),
+        (96, 128, 128, 64, 4),
+        (1 << 30, 128, 128, 128, 4),
+    ],
+)
+# TP2 decode shapes (tuned 2026-10-28, lmh/tune_multi.py): qkv+gate+mirror-kv
+# (4108 rows, 10-45% faster than rocBLAS at M<=128) and shared-expert down
+# (2048 x 256, ~20% faster). Plain qkvg / o_proj / shared gate_up: rocBLAS wins.
+if os.environ.get("WELM_SKINNY_TP2_DEC", "0") == "1":
+    register_skinny_cfg(4108, 2048, [(16, 16, 16, 256, 1), (32, 32, 32, 256, 1),
+                                     (96, 32, 128, 128, 2), (128, 64, 64, 128, 2)])
+    register_skinny_cfg(2048, 256, [(32, 16, 32, 256, 1), (64, 64, 32, 256, 4),
+                                    (96, 64, 64, 256, 2), (128, 64, 32, 256, 4)])
 # WeLM qkv + head-wise gate projection (TP4: 1536 + 2 * 256 + 6 rows).
 register_skinny_cfg(2054, 2048, [(1, 16, 16, 256, 1), (16, 16, 16, 512, 1)])
 

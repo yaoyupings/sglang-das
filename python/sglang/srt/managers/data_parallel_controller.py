@@ -108,6 +108,7 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.waiting_uncached = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
     def update_budget(self, loads):
@@ -120,6 +121,7 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.waiting_uncached[load.dp_rank] = load.num_waiting_uncached_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -851,7 +853,31 @@ class DataParallelController:
         least = min(range(budget.dp_size),
                     key=lambda i: (budget.total_tokens[i], budget.total_requests[i]))
         slack = envs.SGLANG_DP_AFFINITY_SLACK_TOKENS.get()
-        if target is None or budget.total_tokens[target] - budget.total_tokens[least] > slack:
+        prefill_slack = envs.SGLANG_DP_AFFINITY_PREFILL_SLACK.get()
+        if prefill_slack >= 0:
+            # Prefill-aware: estimate each rank's uncached work for this request
+            # (the affinity owner holds the matched prefix, popular prefixes are
+            # cached everywhere) and pick the rank that would finish its queued
+            # prefill plus this one first, keeping affinity within the slack.
+            hit_pop = hit_own = 0
+            for k in keys:
+                e = owner.get(k)
+                if e is None:
+                    break
+                if e[1] >= popular:
+                    hit_pop = k[0]
+                elif e[0] == target:
+                    hit_own = k[0]
+            def cost(i):
+                hit = max(hit_pop, hit_own) if i == target else hit_pop
+                return budget.waiting_uncached[i] + n - hit
+            best = min(range(budget.dp_size), key=lambda i: (cost(i), budget.total_tokens[i]))
+            if target is None or cost(target) - cost(best) > prefill_slack:
+                target = best
+            elif budget.total_tokens[target] - budget.total_tokens[least] > slack:
+                target = least
+            budget.waiting_uncached[target] += cost(target) - budget.waiting_uncached[target]
+        elif target is None or budget.total_tokens[target] - budget.total_tokens[least] > slack:
             target = least
         budget.total_requests[target] += 1
         budget.total_tokens[target] += n

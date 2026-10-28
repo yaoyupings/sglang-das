@@ -825,6 +825,8 @@ class Envs:
     SGLANG_DP_AFFINITY_SLACK_TOKENS = EnvInt(50000)
     # prefix_affinity: prefixes shared by at least this many requests carry no affinity.
     SGLANG_DP_AFFINITY_POPULAR = EnvInt(32)
+    # >= 0 enables prefill-aware prefix affinity (max extra queued uncached tokens to keep affinity)
+    SGLANG_DP_AFFINITY_PREFILL_SLACK = EnvInt(-1)
     # prefix_affinity: halve popularity counts every N dispatched requests.
     SGLANG_DP_AFFINITY_DECAY = EnvInt(1000)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
