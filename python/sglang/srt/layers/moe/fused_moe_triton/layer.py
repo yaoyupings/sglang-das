@@ -1696,7 +1696,7 @@ class FusedMoE(torch.nn.Module):
         i_s: Optional[torch.Tensor] = None,
     ) -> CombineInput:
         # TODO: consider using symmetric memory
-        if bias is None:
+        if bias is None and i_q is None:
             try:
                 return self.quant_method.apply(
                     layer=self,

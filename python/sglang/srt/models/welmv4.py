@@ -135,6 +135,10 @@ _WELM_FUSE_SHARED_EXPERT = get_bool_env_var("WELM_FUSE_SHARED_EXPERT", "true")
 # Also fuse when routed experts are channel-fp8: the shared expert is quantized
 # per output channel into the extra slot at load time.
 _WELM_FUSE_SHARED_FP8 = get_bool_env_var("WELM_FUSE_SHARED_FP8", "false")
+# Fuse the MoE per-token fp8 activation quant into the post-attention norm (decode + prefill).
+_WELM_NORM_QUANT = os.environ.get("WELM_NORM_QUANT", "0") == "1"
+# Add the shared-expert output inside the routed MoE's top-k reduction (fp8 marlin path).
+_WELM_MOE_SUM_SHARED = os.environ.get("WELM_MOE_SUM_SHARED", "0") == "1"
 # Append the head-wise attention gate rows to the qkv projection (one GEMM).
 _WELM_MERGE_GATE_PROJ = get_bool_env_var("WELM_MERGE_GATE_PROJ", "true")
 _WELM_DUMP_PROCESS_DIR = None
@@ -1122,6 +1126,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         from sglang.srt.layers.moe import get_moe_a2a_backend
 
         self.use_a2a = not get_moe_a2a_backend().is_none()
+        # The fp8 routed MoE can take the per-token quant produced by the post-attn norm.
+        self._prequant = None
+        self.accepts_prequant = quant_config is not None and not self.use_a2a
+        if _WELM_MOE_SUM_SHARED and self.accepts_prequant:
+            # moe_sum writes routed + shared into a fresh buffer, not the MoE input.
+            self.experts.moe_runner_config.inplace = False
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -1250,7 +1260,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
-        experts_output = self.experts(hidden_states, topk_output)
+        prequant, self._prequant = self._prequant, None
+        moe_kwargs = {}
+        if (
+            _WELM_MOE_SUM_SHARED
+            and shared_output is not None
+            and self.accepts_prequant
+            and not return_components
+            and num_tokens > 0
+            # Graph-captured (decode) only: the eager prefill path gives wrong results (GSM8K 0.55).
+            and (os.environ.get("WELM_MSS_MODE", "graph") != "graph" or torch.cuda.is_current_stream_capturing())
+        ):
+            # lightop moe_sum adds the shared-expert output (bias) while reducing top-k.
+            moe_kwargs["shared_output"] = shared_output
+            shared_output = None
+            if not getattr(Qwen2MoeSparseMoeBlock, "_mss_logged", False):
+                Qwen2MoeSparseMoeBlock._mss_logged = True
+                logger.info("WELM_MOE_SUM_SHARED: shared expert added inside moe_sum")
+        if prequant is not None and prequant[0].shape[0] == num_tokens:
+            if not getattr(Qwen2MoeSparseMoeBlock, "_nq_logged", False):
+                Qwen2MoeSparseMoeBlock._nq_logged = True
+                logger.info("WELM_NORM_QUANT: MoE uses fused post-attn-norm fp8 quant")
+            experts_output = self.experts(hidden_states, topk_output, i_q=prequant[0], i_s=prequant[1], **moe_kwargs)
+        else:
+            experts_output = self.experts(hidden_states, topk_output, **moe_kwargs)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
         if return_components and skip_component_output:
@@ -2417,13 +2450,28 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
                     hidden_states_fp32 = hidden_states.to(torch.float32)
         elif use_mmq_norm_after_attn:
+            moe_prequant = None
+            if (
+                _WELM_NORM_QUANT
+                and self.is_layer_sparse
+                and getattr(self.mlp, "accepts_prequant", False)
+                and not is_dp_attention_enabled()
+                and hidden_states.shape[0] > 0
+            ):
+                moe_prequant = (
+                    torch.empty(hidden_states.shape, dtype=torch.float8_e4m3fn, device=hidden_states.device),
+                    torch.empty((hidden_states.shape[0], 1), dtype=torch.float32, device=hidden_states.device),
+                )
             hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
                 hidden_states,
                 residual,
                 self.self_attn.o_norm.weight,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
+                quant_out=moe_prequant,
             )
+            if moe_prequant is not None:
+                self.mlp._prequant = moe_prequant
             if (
                 is_dp_attention_enabled()
                 and self.attn_tp_size == 1

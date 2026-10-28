@@ -368,10 +368,12 @@ _SHORT_FIRST_TOKENS = int(os.environ.get("SGLANG_SHORT_FIRST_TOKENS", "0"))
 # >= cached + MIN_GAIN tokens with a request already scheduled for prefill
 # (its KV is not in the radix cache yet); held at most HOLD_MS.
 _INFLIGHT_BLK = int(os.environ.get("SGLANG_INFLIGHT_HOLD_BLK", "0"))
+_PFX_TRACE = os.environ.get("SGLANG_PFX_TRACE", "0") == "1"
 _INFLIGHT_MIN_GAIN = int(os.environ.get("SGLANG_INFLIGHT_HOLD_MIN_GAIN", "2048"))
 # Counted in prefill-scheduling iterations (wall time would desync TP ranks).
 _INFLIGHT_HOLD_IT = int(os.environ.get("SGLANG_INFLIGHT_HOLD_IT", "12"))
 _INFLIGHT_TTL_IT = 4 * _INFLIGHT_HOLD_IT
+_INFLIGHT_AGE_MAX = int(os.environ.get("SGLANG_INFLIGHT_HOLD_AGE_MAX", "16"))
 
 
 def _pfx_chain(req):
@@ -4361,7 +4363,7 @@ class Scheduler(
                 self._inflight_it = 0
             self._inflight_it += 1
             now_ih = self._inflight_it
-            if len(ih) > 4096 or (ih and now_ih - next(iter(ih.values())) > _INFLIGHT_TTL_IT):
+            if len(ih) > 4096 or (ih and now_ih % 16 == 0):
                 for kk in [kk for kk, tt in ih.items() if now_ih - tt > _INFLIGHT_TTL_IT]:
                     del ih[kk]
         for req in self.waiting_queue:
@@ -4373,12 +4375,18 @@ class Scheduler(
                     ch = _pfx_chain(req); ih = self._inflight_pfx; d = 0
                     for k in range(len(ch) - 1, -1, -1):
                         if ch[k] in ih:
-                            d = (k + 1) * _INFLIGHT_BLK; break
+                            # Only fresh owners: an old record whose prefix is still not in the
+                            # tree was evicted or never inserted, so waiting gains nothing.
+                            if now_ih - ih[ch[k]] <= _INFLIGHT_AGE_MAX:
+                                d = (k + 1) * _INFLIGHT_BLK
+                            break
                     if d > 0:
                         req.init_next_round_input(self.tree_cache)
                         if d >= len(req.prefix_indices) + _INFLIGHT_MIN_GAIN:
                             if t0 is None:
                                 req._ih_t0 = now_ih; self._inflight_held += 1
+                                req._ih_d = d; req._ih_c0 = len(req.prefix_indices)
+                                req._ih_age = now_ih - ih[ch[d // _INFLIGHT_BLK - 1]]
                                 if self._inflight_held % 50 == 1:
                                     logger.info(f"inflight-hold: held {self._inflight_held} reqs")
                             continue
@@ -4448,6 +4456,17 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if (
+                _INFLIGHT_BLK > 0
+                and adder.can_run_list
+                and adder.can_run_list[-1] is req
+                and not getattr(req, "_ih_rec", False)
+            ):
+                # Record now so later requests in this same batch that share
+                # the new prefix are held too.
+                req._ih_rec = True
+                for x in _pfx_chain(req):
+                    self._inflight_pfx[x] = now_ih
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -4493,6 +4512,15 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if _PFX_TRACE and self.tp_group.rank_in_group == 0:
+            for r in can_run_list:
+                if not getattr(r, "_tr_done", False):
+                    r._tr_done = True
+                    t0 = getattr(r, "_ih_t0", None)
+                    logger.info(f"pfx-trace rid={r.rid[:8]} len={len(r.origin_input_ids)} cached={len(r.prefix_indices)} "
+                                f"held={0 if t0 is None else self._inflight_it - t0} q={len(self.waiting_queue)} "
+                                f"d={getattr(r, '_ih_d', 0)} c0={getattr(r, '_ih_c0', 0)} age={getattr(r, '_ih_age', 0)} "
+                                f"chunked={int(r is adder.new_chunked_req)}")
         if _INFLIGHT_BLK > 0:
             for r in can_run_list:
                 if not getattr(r, "_ih_rec", False):

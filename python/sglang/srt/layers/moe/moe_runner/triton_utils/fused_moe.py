@@ -1819,19 +1819,38 @@ def fused_moe_fp8_w8a8(
             intermediate_cache1, fp8type=0
         )
 
-        intermediate_cache3 = moe_gemm_marlin_w8a8_fp8(
-            fp8_cache2,
-            w2,
-            intermediate_cache3,
-            fp8_cache2_scale,
-            w2_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            1,
-            cuda_config2,
-        ).view(-1, topk, k)
+        from sglang.srt.layers.moe.welm_moe_down import moe_down_fp8, use_triton_down
+
+        w2_plain = getattr(w2, "_welm_plain", None)
+        if w2_plain is not None and use_triton_down(m, block_size_m):
+            # Prefill-sized M: Triton fp8 down on the unpacked weight copy (faster than marlin here).
+            intermediate_cache3 = moe_down_fp8(
+                fp8_cache2,
+                fp8_cache2_scale.view(-1),
+                w2_plain,
+                w2._welm_plain_scale,
+                intermediate_cache3,
+                topk_weights.view(-1),
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                block_size_m,
+                m,
+            ).view(-1, topk, k)
+        else:
+            intermediate_cache3 = moe_gemm_marlin_w8a8_fp8(
+                fp8_cache2,
+                w2,
+                intermediate_cache3,
+                fp8_cache2_scale,
+                w2_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                1,
+                cuda_config2,
+            ).view(-1, topk, k)
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
         if routed_scaling_factor is None:

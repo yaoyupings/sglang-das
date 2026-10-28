@@ -291,6 +291,10 @@ def mmq_style_norm_after_attn_kernel(
     eps: float,
     NUM_SMS,  # runtime: a constexpr here recompiles per row count
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    xq_ptr=None,
+    xs_ptr=None,
+    QUANT: tl.constexpr = False,
+    FP8_MAX: tl.constexpr = 448.0,
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
     mask = cols_offsets < cols
@@ -309,6 +313,13 @@ def mmq_style_norm_after_attn_kernel(
         tl.store(residual_out_ptr + offsets, hs, mask=mask)
         tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
         tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
+        if QUANT:
+            # Same numerics as fused_moe._per_token_quant_fp8 on the bf16 output.
+            xb = rnorm_out.to(output_dtype).to(tl.float32)
+            sx = tl.maximum(tl.max(tl.where(mask, tl.abs(xb), 0.0)), 1e-10) / FP8_MAX
+            xq = tl.clamp(xb / sx, min=-FP8_MAX, max=FP8_MAX)
+            tl.store(xq_ptr + offsets, xq.to(xq_ptr.dtype.element_ty), mask=mask)
+            tl.store(xs_ptr + row_id, sx)
 
 
 def mmq_style_norm_after_attn(
@@ -317,7 +328,9 @@ def mmq_style_norm_after_attn(
     onorm_weight: torch.Tensor,
     rnorm_weight: torch.Tensor,
     eps: float,
+    quant_out: Optional[tuple] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """quant_out=(xq [rows, cols] fp8, xs [rows, 1] fp32) also writes the per-token fp8 quant of the output."""
     assert hidden_states.dim() == 2
     assert residual.dim() == 2
     assert hidden_states.shape == residual.shape
@@ -344,6 +357,8 @@ def mmq_style_norm_after_attn(
         eps,
         num_sms,
         block_size,
+        *(quant_out if quant_out is not None else (None, None)),
+        QUANT=quant_out is not None,
     )
     return output, residual_out, fp32_out
 

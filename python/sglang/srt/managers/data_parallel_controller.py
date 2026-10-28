@@ -872,10 +872,24 @@ class DataParallelController:
                 hit = max(hit_pop, hit_own) if i == target else hit_pop
                 return budget.waiting_uncached[i] + n - hit
             best = min(range(budget.dp_size), key=lambda i: (cost(i), budget.total_tokens[i]))
-            if target is None or cost(target) - cost(best) > prefill_slack:
+            st = getattr(self, "_aff_stats", None)
+            if st is None:
+                st = self._aff_stats = [0, 0, 0, 0, 0]  # no-owner, kept, break-prefill, break-tokens, n
+            if target is None:
+                st[0] += 1
+                target = best
+            elif cost(target) - cost(best) > prefill_slack:
+                st[2] += 1
                 target = best
             elif budget.total_tokens[target] - budget.total_tokens[least] > slack:
+                st[3] += 1
                 target = least
+            else:
+                st[1] += 1
+            st[4] += 1
+            if st[4] % 500 == 0:
+                logger.info(f"affinity-stats: no-owner {st[0]} kept {st[1]} break-prefill {st[2]} break-tokens {st[3]} "
+                            f"waiting_uncached {list(budget.waiting_uncached)}")
             budget.waiting_uncached[target] += cost(target) - budget.waiting_uncached[target]
         elif target is None or budget.total_tokens[target] - budget.total_tokens[least] > slack:
             target = least

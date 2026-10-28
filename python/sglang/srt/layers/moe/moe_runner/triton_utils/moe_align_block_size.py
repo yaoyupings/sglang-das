@@ -552,6 +552,18 @@ def hcu_moe_align_block_size(
         )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
+    # LightOp's native align drops tokens for num_experts > 512 once numel is large
+    # (verified bad at E=513, M>=2048 x top-11); E=512 and small numel are fine.
+    if num_experts > 512 and topk_ids.numel() > 12288 and expert_mask is None:
+        if not num_token:
+            sorted_ids.fill_(topk_ids.numel())
+        _hcu_moe_align_block_size_fast(
+            topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_tokens_post_pad
+        )
+        if expert_map is not None:
+            expert_ids = expert_map[expert_ids]
+        return sorted_ids, expert_ids, num_tokens_post_pad
+
     if expert_mask is not None:
         _hcu_moe_align_block_size_out(
             topk_ids,
