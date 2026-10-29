@@ -1821,13 +1821,12 @@ def fused_moe_fp8_w8a8(
 
         from sglang.srt.layers.moe.welm_moe_down import moe_down_fp8, use_triton_down
 
-        w2_plain = getattr(w2, "_welm_plain", None)
-        if w2_plain is not None and use_triton_down(m, block_size_m):
-            # Prefill-sized M: Triton fp8 down on the unpacked weight copy (faster than marlin here).
+        if getattr(w2, "_welm_triton_down", False) and use_triton_down(m, block_size_m):
+            # Larger M: Triton fp8 down reading the marlin-packed w2 (faster than marlin here).
             intermediate_cache3 = moe_down_fp8(
                 fp8_cache2,
                 fp8_cache2_scale.view(-1),
-                w2_plain,
+                w2,
                 w2._welm_plain_scale,
                 intermediate_cache3,
                 topk_weights.view(-1),
@@ -1836,6 +1835,7 @@ def fused_moe_fp8_w8a8(
                 num_tokens_post_padded,
                 block_size_m,
                 m,
+                marlin_shape=(origin_w2_shape[0], origin_w2_shape[1], origin_w2_shape[2]),
             ).view(-1, topk, k)
         else:
             intermediate_cache3 = moe_gemm_marlin_w8a8_fp8(

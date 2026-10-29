@@ -646,8 +646,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                             WELM_TRITON_MOE_DOWN_MIN_M,
                         )
 
-                        # Unpacked w2 copy for the Triton prefill down GEMM (packing is in place).
-                        w2_plain = w2.data.clone() if WELM_TRITON_MOE_DOWN_MIN_M > 0 else None
+                        # The Triton down GEMM reads the marlin-packed w2 directly (no extra copy).
+                        w2_plain = WELM_TRITON_MOE_DOWN_MIN_M > 0
                         w1_packed = _pack_per_expert(w1)
                         w2_packed = _pack_per_expert(w2)
 
@@ -665,8 +665,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     setattr(new_w1, "w1_shape", w1_shape)
                     setattr(new_w2, "_w8a8_fp8_packed", True)
                     setattr(new_w2, "w2_shape", w2_shape)
-                    if not self.use_deepep and w2_plain is not None:
-                        new_w2._welm_plain = w2_plain
+                    if not self.use_deepep and w2_plain:
+                        new_w2._welm_triton_down = True
                         new_w2._welm_plain_scale = (
                             layer.w2_weight_scale.data.float().reshape(w2_shape[0], w2_shape[1]).contiguous()
                         )
