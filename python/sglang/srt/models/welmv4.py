@@ -99,6 +99,10 @@ _WELM_FAST_ROUTER = get_bool_env_var("WELM_FAST_ROUTER", "true")
 _WELM_FAST_QK = get_bool_env_var("WELM_FAST_QK", "true")
 # Decode: write k/v into the paged KV cache from the qk-norm/rope kernel.
 _WELM_FUSED_KV_STORE = get_bool_env_var("WELM_FUSED_KV_STORE", "true")
+# Also fuse the fp8_e4m3 KV store (quantize in the rope kernel).
+_WELM_FUSED_KV_STORE_FP8 = get_bool_env_var("WELM_FUSED_KV_STORE_FP8", "false")
+# Decode: apply the head-wise attention output gate inside the HIP decode reduce.
+_WELM_DEC_FUSED_GATE = get_bool_env_var("WELM_DEC_FUSED_GATE", "false")
 
 
 def _welm_fused_kv_store_buffers(forward_batch, layer_id, dtype):
@@ -112,13 +116,18 @@ def _welm_fused_kv_store_buffers(forward_batch, layer_id, dtype):
         pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
     except Exception:
         pool = None
+    fp8 = (
+        _WELM_FUSED_KV_STORE_FP8
+        and pool is not None
+        and getattr(pool, "dtype", None) == torch.float8_e4m3fn
+    )
     if (
         pool is None
         or not _mp._kv_layout_hcu_fa
         or getattr(pool, "use_hnd", True)
         or not hasattr(pool, "k_buffer")
-        or getattr(pool, "dtype", None) != dtype
-        or getattr(pool, "store_dtype", None) != dtype
+        or (not fp8 and getattr(pool, "dtype", None) != dtype)
+        or (not fp8 and getattr(pool, "store_dtype", None) != dtype)
         or getattr(pool, "start_layer", None) is None
     ):
         return None
@@ -128,6 +137,12 @@ def _welm_fused_kv_store_buffers(forward_batch, layer_id, dtype):
     k_buf, v_buf = pool.k_buffer[idx], pool.v_buffer[idx]
     if k_buf.dim() != 4 or v_buf.dim() != 4:
         return None
+    if fp8:
+        # WeLM static per-layer fp8 KV (memory_pool set_kv_buffer fp8 branch)
+        from sglang.srt.layers.attention import welm_kv_fp8
+
+        k_buf, v_buf = welm_kv_fp8.as_fp8(k_buf), welm_kv_fp8.as_fp8(v_buf)
+        return k_buf, v_buf, welm_kv_fp8.register_buffer(layer_id, k_buf, v_buf)
     return k_buf, v_buf
 # Run the shared expert as an extra (always selected, weight 1) expert inside
 # the routed fused MoE instead of three separate GEMM/activation kernels.
@@ -1942,7 +1957,7 @@ class Qwen2MoeAttention(nn.Module):
                     forward_batch, self.attn.layer_id, k.dtype
                 )
                 if bufs is not None and bufs[0].shape[1] == k.shape[1] // self.head_dim:
-                    kv_store = (v, bufs[0], bufs[1], forward_batch.out_cache_loc)
+                    kv_store = (v, bufs[0], bufs[1], forward_batch.out_cache_loc) + tuple(bufs[2:])
             k, q = welm_qk_norm_rope(
                 q,
                 k,
@@ -1985,16 +2000,32 @@ class Qwen2MoeAttention(nn.Module):
             attn_kwargs["save_kv_cache"] = False
         if _WELM_QKV_CAP and forward_batch.forward_mode.is_extend() and q.shape[0] >= 2048:
             _welm_qkv_capture(self, q, k, v, attn_kwargs.get("sinks"), forward_batch)
-        if q_prescaled:
-            _fa_iface.WELM_Q_PRESCALED = True
-            try:
+        hand_gate = (
+            _WELM_DEC_FUSED_GATE
+            and gate is not None
+            and forward_batch.forward_mode.is_decode()
+            and not dump_this_layer
+        )
+        if hand_gate:
+            _fa_iface.WELM_OUT_GATE = gate
+            _fa_iface.WELM_OUT_GATE_DONE = False
+        try:
+            if q_prescaled:
+                _fa_iface.WELM_Q_PRESCALED = True
+                try:
+                    attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
+                finally:
+                    _fa_iface.WELM_Q_PRESCALED = False
+            else:
                 attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
-            finally:
-                _fa_iface.WELM_Q_PRESCALED = False
-        else:
-            attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
+        finally:
+            gate_applied = hand_gate and _fa_iface.WELM_OUT_GATE_DONE
+            if hand_gate:
+                _fa_iface.WELM_OUT_GATE = None
+                _fa_iface.WELM_OUT_GATE_DONE = False
         return self._attn_post(
-            attn_output, hidden_states, dump_this_layer, dump_prefix, skip_o_norm, gate
+            attn_output, hidden_states, dump_this_layer, dump_prefix, skip_o_norm, gate,
+            gate_applied=gate_applied,
         )
 
     def build_qkvg_weight(self):
@@ -2106,10 +2137,13 @@ class Qwen2MoeAttention(nn.Module):
         dump_prefix,
         skip_o_norm,
         gate=None,
+        gate_applied=False,
     ):
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
-        if gate is not None and attn_output.dim() == 2:
+        if gate_applied:
+            pass  # the HIP decode reduce already multiplied by sigmoid(gate)
+        elif gate is not None and attn_output.dim() == 2:
             sigmoid_mul_strided_(gate, attn_output, self.num_heads)
         elif self.gated_self_attention_headwise:
             attn_shape = attn_output.shape

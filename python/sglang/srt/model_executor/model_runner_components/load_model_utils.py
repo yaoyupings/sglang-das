@@ -155,6 +155,18 @@ def load_kv_cache_scales(
                     min(values),
                     max(values),
                 )
+            elif os.environ.get("WELM_KV_FP8_SCALES"):
+                # WeLM HCU fp8 KV: static per-layer scales come from
+                # welm_kv_fp8 (keyed by KV buffer); drop the implicit 1.0
+                # descales so the pool / attention take the WeLM fp8 paths.
+                for module in candidates:
+                    module.k_scale = None
+                    module.v_scale = None
+                logger.info(
+                    "WeLM fp8 KV: per-layer scales from %s (%d attention layers)",
+                    os.environ["WELM_KV_FP8_SCALES"],
+                    len(candidates),
+                )
             else:
                 logger.warning(
                     "Using FP8 KV cache but no scaling factors "

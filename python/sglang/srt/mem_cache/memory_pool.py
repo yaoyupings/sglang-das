@@ -105,6 +105,8 @@ from sglang.srt.utils import get_bool_env_var
 
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
 _welm_fast_kv_store = get_bool_env_var("SGLANG_HCU_FAST_KV_STORE", default="true")
+_welm_kv_amax_dump = bool(os.environ.get("WELM_KV_AMAX_DUMP"))
+_welm_kv_fakeq = os.environ.get("WELM_KV_FAKEQ", "")  # "k", "v" or "kv": e4m3 round trip in a bf16 pool
 
 logger = logging.getLogger(__name__)
 
@@ -2634,6 +2636,20 @@ class MHATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         global_layer_id = layer.layer_id if layer is not None else layer_id
+        if _welm_kv_amax_dump:
+            from sglang.srt.layers.attention import welm_kv_fp8
+
+            welm_kv_fp8.record_amax(global_layer_id, cache_k, cache_v)
+        if _welm_kv_fakeq and cache_k.dtype == torch.bfloat16:
+            # Diagnostic: bf16 pool holding e4m3 round-tripped K and/or V
+            # (same static scales as the fp8 pool).
+            from sglang.srt.layers.attention import welm_kv_fp8
+
+            ks, vs = welm_kv_fp8.layer_scales(global_layer_id)
+            if "k" in _welm_kv_fakeq:
+                cache_k = ((cache_k.float() / ks).clamp(-448, 448).to(torch.float8_e4m3fn).float() * ks).to(cache_k.dtype)
+            if "v" in _welm_kv_fakeq:
+                cache_v = ((cache_v.float() / vs).clamp(-448, 448).to(torch.float8_e4m3fn).float() * vs).to(cache_v.dtype)
 
         if self.is_quantized_kv_cache:
             if dcp_kv_mask is not None:
@@ -2685,6 +2701,40 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        if (
+            _kv_layout_hcu_fa
+            and not self.use_hnd
+            and self.dtype == torch.float8_e4m3fn
+            and cache_k.dtype != self.dtype
+            and k_scale is None
+            and dcp_kv_mask is None
+            and cache_k.stride(-1) == 1
+            and cache_v.stride(-1) == 1
+        ):
+            # WeLM fp8 KV on the HCU legacy layout: static per-layer scales
+            # (welm_kv_fp8), quantized inside the paged store kernel.
+            from sglang.srt.layers.attention import welm_kv_fp8
+            from sglang.srt.layers.welmv4_fast_op import welm_hcu_store_kv
+
+            k_buf = self.k_buffer[layer_id - self.start_layer]
+            v_buf = self.v_buffer[layer_id - self.start_layer]
+            k_buf = welm_kv_fp8.as_fp8(k_buf)
+            v_buf = welm_kv_fp8.as_fp8(v_buf)
+            scales = welm_kv_fp8.register_buffer(global_layer_id, k_buf, v_buf)
+            welm_kv_fp8.trace("store", global_layer_id, cache_k.shape, cache_k.dtype, scales)
+            welm_hcu_store_kv(cache_k, cache_v, k_buf, v_buf, loc, kv_scales=scales)
+            if welm_kv_fp8.CHECK and not torch.cuda.is_current_stream_capturing():
+                pg, off = loc.long() // self.page_size, loc.long() % self.page_size
+                rk = k_buf[pg, :, off, :].float() * scales[0]
+                rv = v_buf[pg, :, :, off].float() * scales[1]
+                welm_kv_fp8.report(f"store L{global_layer_id} k", rk, cache_k.float())
+                welm_kv_fp8.report(f"store L{global_layer_id} v", rv, cache_v.float())
+            return
+
+        if cache_k.dtype != self.dtype and self.dtype == torch.float8_e4m3fn:
+            from sglang.srt.layers.attention import welm_kv_fp8
+
+            welm_kv_fp8.trace("generic_store", global_layer_id, cache_k.shape, cache_k.stride(), k_scale)
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)

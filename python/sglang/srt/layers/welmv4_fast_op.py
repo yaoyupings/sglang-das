@@ -245,6 +245,9 @@ def _welm_qk_norm_rope_kernel(
     loc_ptr=None,
     PAGE: tl.constexpr = 1,
     STORE_KV: tl.constexpr = False,
+    k_inv=1.0,
+    v_inv=1.0,
+    QUANT_KV: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     HALF: tl.constexpr = ROPE_DIM // 2
@@ -284,10 +287,19 @@ def _welm_qk_norm_rope_kernel(
         vsrc = v_ptr + t.to(tl.int64) * v_stride + kh[:, None] * HEAD_DIM + d[None, :]
         vv = tl.load(vsrc, mask=kmask, other=0.0)
         vdst = vc_ptr + ((page * KH + kh[:, None]) * HEAD_DIM + d[None, :]) * PAGE + off
+        if QUANT_KV:
+            # fp8 KV, same as _welm_hcu_store_kv_kernel on the bf16 k/v
+            c8 = kc_ptr.dtype.element_ty
+            vv = tl.minimum(tl.maximum(vv.to(tl.float32) * v_inv, -448.0), 448.0).to(c8)
+            kx = tl.minimum(tl.maximum(kx.to(out_ty).to(tl.float32) * k_inv, -448.0), 448.0)
+            r1 = tl.minimum(tl.maximum(r1.to(out_ty).to(tl.float32) * k_inv, -448.0), 448.0)
+            r2 = tl.minimum(tl.maximum(r2.to(out_ty).to(tl.float32) * k_inv, -448.0), 448.0)
+            out_ty = c8
         tl.store(vdst, vv, mask=kmask)
     tl.store(obase + d[None, :], kx.to(out_ty), mask=kmask & (d[None, :] < NOPE))
     tl.store(obase + NOPE + dh[None, :], r1.to(out_ty), mask=kmask)
     tl.store(obase + NOPE + HALF + dh[None, :], r2.to(out_ty), mask=kmask)
+    out_ty = k_out_ptr.dtype.element_ty
 
     # ---- q ----
     qh = tl.arange(0, QH_B)
@@ -342,7 +354,8 @@ def welm_qk_norm_rope(
     kh = k.shape[1] // head_dim
     assert q.stride(1) == 1 and k.stride(1) == 1
     if kv_store is not None:
-        v, k_cache, v_cache, loc = kv_store
+        v, k_cache, v_cache, loc = kv_store[:4]
+        kv_scales = kv_store[4] if len(kv_store) > 4 else None
         assert v.stride(1) == 1 and k_cache.shape[1] == kh
     k_out = (
         torch.empty((T, kh * head_dim), dtype=k.dtype, device=k.device)
@@ -385,6 +398,9 @@ def welm_qk_norm_rope(
         loc_ptr=kv_store[3] if kv_store is not None else None,
         PAGE=kv_store[1].shape[2] if kv_store is not None else 1,
         STORE_KV=kv_store is not None,
+        k_inv=1.0 / kv_scales[0] if kv_store is not None and kv_scales is not None else 1.0,
+        v_inv=1.0 / kv_scales[1] if kv_store is not None and kv_scales is not None else 1.0,
+        QUANT_KV=kv_store is not None and kv_scales is not None,
         num_warps=4,
     )
     return (k_out, q_out) if return_q else k_out
@@ -409,6 +425,9 @@ def _welm_hcu_store_kv_kernel(
     P: tl.constexpr,
     D: tl.constexpr,
     DV: tl.constexpr,
+    k_inv=1.0,
+    v_inv=1.0,
+    QUANT: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -417,14 +436,22 @@ def _welm_hcu_store_kv_kernel(
     off = loc % P
     d = tl.arange(0, D)
     kv = tl.load(k_ptr + t.to(tl.int64) * k_stride_t + h * k_stride_h + d)
+    if QUANT:
+        # fp8 KV: x8 = sat(x / scale); real = x8 * scale
+        kv = tl.minimum(tl.maximum(kv.to(tl.float32) * k_inv, -448.0), 448.0)
+        kv = kv.to(kc_ptr.dtype.element_ty)
     tl.store(kc_ptr + ((page * H + h) * P + off) * D + d, kv)
     dv = tl.arange(0, DV)
     vv = tl.load(v_ptr + t.to(tl.int64) * v_stride_t + h * v_stride_h + dv)
+    if QUANT:
+        vv = tl.minimum(tl.maximum(vv.to(tl.float32) * v_inv, -448.0), 448.0)
+        vv = vv.to(vc_ptr.dtype.element_ty)
     tl.store(vc_ptr + ((page * H + h) * DV + dv) * P + off, vv)
 
 
-def welm_hcu_store_kv(cache_k, cache_v, k_buffer, v_buffer, loc):
-    """cache_k: (T, H, D) / (T, H*D); k_buffer (pages, H, P, D); v_buffer (pages, H, DV, P)."""
+def welm_hcu_store_kv(cache_k, cache_v, k_buffer, v_buffer, loc, kv_scales=None):
+    """cache_k: (T, H, D) / (T, H*D); k_buffer (pages, H, P, D); v_buffer (pages, H, DV, P).
+    kv_scales=(k_scale, v_scale): quantize into fp8 buffers (real = x8 * scale)."""
     T = loc.shape[0]
     if T == 0:
         return
@@ -447,6 +474,9 @@ def welm_hcu_store_kv(cache_k, cache_v, k_buffer, v_buffer, loc):
         P=P,
         D=D,
         DV=DV,
+        k_inv=1.0 / kv_scales[0] if kv_scales is not None else 1.0,
+        v_inv=1.0 / kv_scales[1] if kv_scales is not None else 1.0,
+        QUANT=kv_scales is not None,
         num_warps=1 if D <= 128 else 2,
     )
 
@@ -748,6 +778,17 @@ def warmup_skinny_gemm(w: torch.Tensor) -> None:
 # v [blocks, kv_heads, D, PAGE].  Lengths are read on device (graph-safe).
 # ---------------------------------------------------------------------------
 @triton.jit
+def _e4m3_to_bf16(x):
+    """fp8 e4m3fn bits (uint8) -> bf16 (exact) via the native gfx938
+    v_cvt_f32_fp8, one element per asm call (pack=4 mis-packs some 2-D
+    layouts). 1.4x faster than Triton's fp8 cast, which is emulated; the f32
+    -> bf16 step truncates, exact since every e4m3 value fits in bf16."""
+    f = tl.inline_asm_elementwise("v_cvt_f32_fp8_e32 $0, $1", "=v,v", [x],
+                                  dtype=tl.float32, is_pure=True, pack=1)
+    return (f.to(tl.uint32, bitcast=True) >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
 def _welm_pfx_attn_partial_kernel(
     Q, K, V, BT, SEQK, CUQ, MID_O, MID_LSE, sm_scale,
     stride_qt, stride_qh,
@@ -757,7 +798,7 @@ def _welm_pfx_attn_partial_kernel(
     stride_mo_t, stride_mo_h, stride_mo_s,
     stride_ml_t, stride_ml_h,
     G: tl.constexpr, KVH: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
-    BLOCK_M: tl.constexpr, NUM_SPLITS: tl.constexpr,
+    BLOCK_M: tl.constexpr, NUM_SPLITS: tl.constexpr, KV_FP8: tl.constexpr = False,
 ):
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -793,6 +834,7 @@ def _welm_pfx_attn_partial_kernel(
     for start in range(k_lo, k_hi, PAGE):
         page = tl.load(BT + b * stride_bt + start // PAGE)
         k = tl.load(K + page * stride_kb + kvh * stride_kh + offs_p[:, None] * stride_kp + offs_d[None, :])
+        k = _e4m3_to_bf16(k) if KV_FP8 else k.to(q.dtype)
         qk = tl.dot(q, tl.trans(k)) * sm_scale
         k_pos = start + offs_p
         valid = (k_pos[None, :] <= q_pos[:, None]) & (k_pos[None, :] < k_hi)
@@ -802,6 +844,7 @@ def _welm_pfx_attn_partial_kernel(
         p = tl.exp(qk - m_safe[:, None])
         alpha = tl.exp(m_i - m_safe)
         v = tl.load(V + page * stride_vb + kvh * stride_vh + offs_d[:, None] * stride_vd + offs_p[None, :])
+        v = _e4m3_to_bf16(v) if KV_FP8 else v.to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), tl.trans(v))
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
@@ -823,7 +866,7 @@ def _welm_pfx_attn_reduce_kernel(
     stride_mo_t, stride_mo_h, stride_mo_s,
     stride_ml_t, stride_ml_h,
     stride_ot, stride_oh,
-    D: tl.constexpr, NUM_SPLITS: tl.constexpr, HAS_SINK: tl.constexpr,
+    D: tl.constexpr, NUM_SPLITS: tl.constexpr, HAS_SINK: tl.constexpr, v_scale=1.0,
 ):
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -839,7 +882,7 @@ def _welm_pfx_attn_reduce_kernel(
     if HAS_SINK:
         denom += tl.exp(sink - m)
     o = tl.load(MID_O + t * stride_mo_t + h * stride_mo_h + offs_s[:, None] * stride_mo_s + offs_d[None, :])
-    out = tl.sum(o * w[:, None], 0) / denom
+    out = tl.sum(o * w[:, None], 0) / denom * v_scale
     tl.store(OUT + t * stride_ot + h * stride_oh + offs_d, out.to(OUT.dtype.element_ty))
 
 
@@ -855,11 +898,20 @@ def welm_prefix_attention(
     sinks: torch.Tensor = None, # [H] or None
     out: torch.Tensor = None,
     num_splits: int = 32,
-    block_m: int = 32,
-    num_warps: int = 4,
+    block_m: int = None,        # default 32; 64 for fp8 KV
+    num_warps: int = None,      # default 4; 2 for fp8 KV (B4 x 512q L8000: 12.7 vs 31 ms at m32 w4)
     num_stages: int = 1,
+    kv_scales=None,             # (k_scale, v_scale) for fp8 caches
 ):
     total_q, H, D = q.shape
+    ks, vs = kv_scales if kv_scales is not None else (1.0, 1.0)
+    kv8 = k_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
+    if block_m is None:
+        block_m = 64 if kv8 else 32
+    if num_warps is None:
+        num_warps = 2 if kv8 else 4
+    if kv8:
+        k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
     KVH, PAGE = k_cache.shape[1], k_cache.shape[2]
     G = H // KVH
     bs = cu_seqlens_q.shape[0] - 1
@@ -870,7 +922,7 @@ def welm_prefix_attention(
     grid = (bs * KVH, triton.cdiv(max_seqlen_q * G, block_m), num_splits)
     _welm_pfx_attn_partial_kernel[grid](
         q, k_cache, v_cache, block_table, seqused_k, cu_seqlens_q, mid_o, mid_lse,
-        softmax_scale,
+        softmax_scale * ks,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
@@ -878,14 +930,14 @@ def welm_prefix_attention(
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         mid_lse.stride(0), mid_lse.stride(1),
         G=G, KVH=KVH, D=D, PAGE=PAGE, BLOCK_M=block_m, NUM_SPLITS=num_splits,
-        num_warps=num_warps, num_stages=num_stages,
+        KV_FP8=kv8, num_warps=num_warps, num_stages=num_stages,
     )
     _welm_pfx_attn_reduce_kernel[(total_q, H)](
         mid_o, mid_lse, sinks if sinks is not None else mid_lse, out,
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         mid_lse.stride(0), mid_lse.stride(1),
         out.stride(0), out.stride(1),
-        D=D, NUM_SPLITS=num_splits, HAS_SINK=sinks is not None,
+        D=D, NUM_SPLITS=num_splits, HAS_SINK=sinks is not None, v_scale=vs,
         num_warps=4,
     )
     return out
@@ -905,6 +957,7 @@ def _welm_dec_attn_partial_kernel(
     stride_ml_b, stride_ml_h,
     G: tl.constexpr, KVH: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
     BLOCK_M: tl.constexpr, CHUNK_PAGES: tl.constexpr, WINDOW_LEFT: tl.constexpr = -1,
+    KV_FP8: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     split = tl.program_id(1)
@@ -936,6 +989,7 @@ def _welm_dec_attn_partial_kernel(
     for start in range(lo, hi, PAGE):
         page = tl.load(BT + b * stride_bt + start // PAGE).to(tl.int64)
         k = tl.load(K + page * stride_kb + kvh * stride_kh + offs_p[:, None] * stride_kp + offs_d[None, :])
+        k = _e4m3_to_bf16(k) if KV_FP8 else k.to(q.dtype)
         qk = tl.dot(q, tl.trans(k)) * sm_scale
         kpos = start + offs_p
         qk = tl.where(((kpos < hi) & (kpos >= w_lo))[None, :], qk, float("-inf"))
@@ -944,6 +998,7 @@ def _welm_dec_attn_partial_kernel(
         p = tl.exp(qk - m_safe[:, None])
         alpha = tl.exp(m_i - m_safe)
         v = tl.load(V + page * stride_vb + kvh * stride_vh + offs_d[:, None] * stride_vd + offs_p[None, :])
+        v = _e4m3_to_bf16(v) if KV_FP8 else v.to(q.dtype)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), tl.trans(v))
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
@@ -962,6 +1017,7 @@ def _welm_dec_attn_reduce_kernel(
     stride_ob, stride_oh,
     D: tl.constexpr, PAGE: tl.constexpr, CHUNK_PAGES: tl.constexpr,
     BLOCK_S: tl.constexpr, HAS_SINK: tl.constexpr, WINDOW_LEFT: tl.constexpr = -1,
+    v_scale=1.0,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -992,26 +1048,33 @@ def _welm_dec_attn_reduce_kernel(
         acc = acc * scale + tl.sum(o * w[:, None], 0)
         denom = denom * scale + tl.sum(w, 0)
         m = m_new
-    out = acc / tl.where(denom > 0, denom, 1.0)
+    out = acc / tl.where(denom > 0, denom, 1.0) * v_scale
     tl.store(OUT + b * stride_ob + h * stride_oh + offs_d, out.to(OUT.dtype.element_ty))
 
 
 def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_scale,
                           max_context_len, sinks=None, out=None, chunk_pages=None,
-                          num_warps=None, num_stages=1, block_s=32, window_left=-1):
+                          num_warps=None, num_stages=1, block_s=32, window_left=-1,
+                          kv_scales=None):
     """One query token per row: q [B, H, D] -> out [B, H, D].
 
     k_cache [blocks, KVH, PAGE, D], v_cache [blocks, KVH, D, PAGE] (HCU legacy
     layout). Splits are CHUNK_PAGES pages each; the grid covers
     max_context_len and splits past a row's length exit, so no host-side
     length is needed (CUDA-graph safe)."""
+    kv8 = k_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
+    # fp8 KV: 1 page x 1 warp is fastest by far (B64 L1600: 136 us vs 375 us
+    # at 2 pages x 2 warps; bf16 KV 162 us).
     if chunk_pages is None:
-        chunk_pages = 2 if q.shape[0] <= 16 else 4
+        chunk_pages = 1 if kv8 else (2 if q.shape[0] <= 16 else 4)
     if num_warps is None:
-        num_warps = 4 if q.shape[0] <= 16 else 2
+        num_warps = 1 if kv8 else (4 if q.shape[0] <= 16 else 2)
     B, H, D = q.shape
     KVH, PAGE = k_cache.shape[1], k_cache.shape[2]
     G = H // KVH
+    ks, vs = kv_scales if kv_scales is not None else (1.0, 1.0)
+    if kv8:
+        k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
     max_splits = triton.cdiv(max_context_len, chunk_pages * PAGE)
     # window_left >= 0: the grid spans the window (+1 for alignment); the
     # partials keep absolute split indices.
@@ -1025,7 +1088,7 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
     if out is None:
         out = torch.empty_like(q)
     _welm_dec_attn_partial_kernel[(B * KVH, grid_splits)](
-        q, k_cache, v_cache, block_table, seq_lens, mid_o, mid_lse, softmax_scale,
+        q, k_cache, v_cache, block_table, seq_lens, mid_o, mid_lse, softmax_scale * ks,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
@@ -1033,7 +1096,7 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
         mid_lse.stride(0), mid_lse.stride(1),
         G=G, KVH=KVH, D=D, PAGE=PAGE, BLOCK_M=max(16, triton.next_power_of_2(G)),
-        CHUNK_PAGES=chunk_pages, WINDOW_LEFT=window_left,
+        CHUNK_PAGES=chunk_pages, WINDOW_LEFT=window_left, KV_FP8=kv8,
         num_warps=num_warps, num_stages=num_stages,
     )
     _welm_dec_attn_reduce_kernel[(B, H)](
@@ -1042,7 +1105,7 @@ def welm_decode_attention(q, k_cache, v_cache, block_table, seq_lens, softmax_sc
         mid_lse.stride(0), mid_lse.stride(1),
         out.stride(0), out.stride(1),
         D=D, PAGE=PAGE, CHUNK_PAGES=chunk_pages, BLOCK_S=block_s, HAS_SINK=sinks is not None,
-        WINDOW_LEFT=window_left, num_warps=4,
+        WINDOW_LEFT=window_left, v_scale=vs, num_warps=4,
     )
     return out
 
@@ -1059,7 +1122,7 @@ def _welm_pagedkv_to_contig_kernel(
     stride_kb, stride_kh, stride_kp,
     stride_vb, stride_vh, stride_vd,
     stride_bt, stride_kt_t, stride_kt_h, stride_vt_t, stride_vt_h,
-    D: tl.constexpr, PAGE: tl.constexpr,
+    D: tl.constexpr, PAGE: tl.constexpr, k_scale=1.0, v_scale=1.0, DEQUANT: tl.constexpr = False,
 ):
     b = tl.program_id(0)
     p = tl.program_id(1)
@@ -1074,13 +1137,19 @@ def _welm_pagedkv_to_contig_kernel(
     offs_d = tl.arange(0, D)
     m = (t0 + offs_t) < n
     k = tl.load(K + page * stride_kb + h * stride_kh + offs_t[:, None] * stride_kp + offs_d[None, :])
+    if DEQUANT:
+        k = (_e4m3_to_bf16(k).to(tl.float32) * k_scale).to(KT.dtype.element_ty)
     tl.store(KT + (base + t0 + offs_t)[:, None] * stride_kt_t + h * stride_kt_h + offs_d[None, :], k, mask=m[:, None])
     v = tl.load(V + page * stride_vb + h * stride_vh + offs_d[:, None] * stride_vd + offs_t[None, :])  # [D, P]
+    if DEQUANT:
+        v = (_e4m3_to_bf16(v).to(tl.float32) * v_scale).to(VT.dtype.element_ty)
     tl.store(VT + (base + t0 + offs_t)[None, :] * stride_vt_t + h * stride_vt_h + offs_d[:, None], v, mask=m[None, :])
 
 
-def welm_pagedkv_to_contiguous(kt, vt, k_cache, v_cache, block_table, seqused_k, cu_k, max_seqlen_k):
-    """Fills kt/vt [>= sum(seqused_k), KVH, D] and cu_k [bs + 1] (int32)."""
+def welm_pagedkv_to_contiguous(kt, vt, k_cache, v_cache, block_table, seqused_k, cu_k, max_seqlen_k,
+                               kv_scales=None):
+    """Fills kt/vt [>= sum(seqused_k), KVH, D] and cu_k [bs + 1] (int32).
+    kv_scales=(k_scale, v_scale): dequantize an fp8 cache into bf16 kt/vt."""
     bs = seqused_k.shape[0]
     cu_k[:1].zero_()
     torch.cumsum(seqused_k, 0, out=cu_k[1:])
@@ -1088,10 +1157,15 @@ def welm_pagedkv_to_contiguous(kt, vt, k_cache, v_cache, block_table, seqused_k,
     max_pages = triton.cdiv(int(max_seqlen_k), PAGE)
     if bs == 0 or max_pages == 0:
         return
+    if kv_scales is not None:
+        k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
     _welm_pagedkv_to_contig_kernel[(bs, max_pages, KVH)](
         k_cache, v_cache, kt, vt, block_table, seqused_k, cu_k,
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
         block_table.stride(0), kt.stride(0), kt.stride(1), vt.stride(0), vt.stride(1),
-        D=D, PAGE=PAGE, num_warps=4,
+        D=D, PAGE=PAGE,
+        k_scale=kv_scales[0] if kv_scales is not None else 1.0,
+        v_scale=kv_scales[1] if kv_scales is not None else 1.0,
+        DEQUANT=kv_scales is not None, num_warps=4,
     )

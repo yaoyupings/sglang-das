@@ -289,6 +289,17 @@ _WELM_FP8_PREFILL_CHECK = [int(__import__("os").environ.get("WELM_FP8_PREFILL_CH
 _WELM_VARLEN_PREFILL = __import__("os").environ.get("WELM_VARLEN_PREFILL_ATTN", "false").lower() in ("1", "true")
 
 
+_welm_static_amax_cache = {}
+
+
+def _welm_static_amax(ks, vs, device):
+    t = _welm_static_amax_cache.get((ks, vs, device))
+    if t is None:
+        t = torch.tensor([ks * 448.0, vs * 448.0], dtype=torch.float32, device=device)
+        _welm_static_amax_cache[(ks, vs, device)] = t
+    return t
+
+
 def _welm_q8(x):
     s = (x.abs().amax().float() / 448.0).clamp(min=1e-8)
     return (x.float() / s).to(torch.float8_e4m3fn), s.view(1)
@@ -298,7 +309,7 @@ def _welm_fp8_prefill_ok(q, key_cache, window_size, total_k):
     return (
         (_WELM_FP8_PREFILL or _WELM_VARLEN_PREFILL)
         and q.dtype == torch.bfloat16
-        and key_cache.dtype == torch.bfloat16
+        and (key_cache.dtype == torch.bfloat16 or (_WELM_FP8_PAGED and key_cache.dtype == torch.float8_e4m3fn))
         and tuple(window_size) == (-1, -1)
         and isinstance(total_k, int)
         and total_k > 0
@@ -326,7 +337,18 @@ def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
     B = seqused_k.shape[0]
     HK, Pg, D = key_cache.shape[1], key_cache.shape[2], key_cache.shape[3]
     maxp = min(page_table.shape[1], (int(max_seqlen_k) + Pg - 1) // Pg)
-    if _WELM_FP8_TRITON:
+    if key_cache.dtype == torch.float8_e4m3fn:
+        # fp8 KV cache: gather the pages as-is with the static per-layer scales
+        from sglang.srt.layers.attention import welm_kv_fp8
+
+        kvq = _welm_kvq()
+        ksf, vsf = welm_kv_fp8.scales_for(key_cache)
+        welm_kv_fp8.trace("fp8_paged_prefill", q.shape, ksf, vsf)
+        k8, v8 = kvq.gather_kv_fp8(key_cache, value_cache, page_table, maxp)
+        amax = _welm_static_amax(ksf, vsf, q.device)
+        ks = amax[0:1] / 448.0
+        vs = amax[1:2] / 448.0
+    elif _WELM_FP8_TRITON:
         # fused gather + per-tensor e4m3 quant (welm_opt/fa8/kvq.py)
         kvq = _welm_kvq()
         k8, v8, amax = kvq.gather_quant_kv(key_cache, value_cache, page_table, seqused_k, maxp)
@@ -352,7 +374,7 @@ def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
         C = float((q.abs().amax().float() / 448.0 * ks.view(-1)[0]).item()) * _WELM_QK_MARGIN
         _WELM_QK_C[ck] = C
     qs = C / ks.view(1)
-    if _WELM_FP8_TRITON:
+    if _WELM_FP8_TRITON or key_cache.dtype == torch.float8_e4m3fn:
         q8 = kvq.quant_q(q, amax, C)
     else:
         q8 = (q.float() / qs).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
@@ -1728,7 +1750,8 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
+            if not self._use_hcu_legacy_layout:
+                q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         # Check if we should use local attention
@@ -1969,7 +1992,8 @@ class FlashAttentionBackend(AttentionBackend):
                 and not use_cascade_attn
                 and not use_local_attn
                 and not layer.is_cross_attention
-                and self.kv_cache_dtype_str == "auto"
+                and self.kv_cache_dtype_str in ("auto", "fp8_e4m3")
+                and layer.k_scale is None
                 and _hcu_mixed_decode_rows(forward_batch) > 0
             ):
                 result = self._hcu_mixed_extend_attention(
@@ -2550,7 +2574,8 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
+            if not self._use_hcu_legacy_layout:
+                q = q.to(self.kv_cache_dtype) if is_nmz_fp8(self.kv_cache_dtype) else q
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if fa_k_descale is not None:

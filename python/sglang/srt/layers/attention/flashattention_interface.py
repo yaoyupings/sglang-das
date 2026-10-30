@@ -351,18 +351,46 @@ def vllm_flash_attn_with_kvcache(
             layout=layout,
         )
 
+    kv8 = _welm_kv_fp8(k_cache) if _is_hcu else None
+    if kv8 is not None and not _use_welm_decode_attention(
+        q, k_cache, v_cache, page_table, window_size, softcap, return_softmax_lse
+    ):
+        raise RuntimeError(
+            "fp8_e4m3 KV: unsupported paged decode call "
+            f"(q {tuple(q.shape)} {q.dtype}, window {window_size}, softcap {softcap}, lse {return_softmax_lse})"
+        )
     if _is_hcu and _use_welm_decode_attention(
         q, k_cache, v_cache, page_table, window_size, softcap, return_softmax_lse
     ):
         from sglang.srt.layers.welmv4_fast_op import welm_decode_attention
 
+        from sglang.srt.layers.attention import welm_kv_fp8 as _w8; _w8.trace("decode", q.shape, k_cache.dtype, window_size, kv8, softmax_scale)
         B, _, H, D = q.shape
         window_left = (
             window_size[0]
             if window_size is not None and tuple(window_size) != (-1, -1)
             else -1
         )
-        out = welm_decode_attention(
+        _dec_fn = welm_decode_attention
+        _dec_kw = {"chunk_pages": 1, "num_warps": 1 if kv8 is not None else 2} if window_left >= 0 else {}
+        if _WELM_HIP_DEC and (kv8 is not None or _WELM_HIP_DEC == "all"):
+            from sglang.srt.layers import welm_hip_dec
+
+            if welm_hip_dec.supported(q.view(B, H, D), k_cache, v_cache):
+                _dec_fn, _dec_kw = welm_hip_dec.hip_decode, {}
+                global WELM_OUT_GATE_DONE
+                _g = WELM_OUT_GATE
+                if (
+                    _g is not None
+                    and _g.dim() == 2
+                    and tuple(_g.shape) == (B, H)
+                    and _g.stride(1) == 1
+                    and _g.dtype == torch.bfloat16
+                    and q.dtype == torch.bfloat16
+                ):
+                    _dec_kw = {"gate": _g}
+                    WELM_OUT_GATE_DONE = True
+        out = _dec_fn(
             q.view(B, H, D),
             k_cache,
             v_cache,
@@ -372,8 +400,18 @@ def vllm_flash_attn_with_kvcache(
             page_table.shape[1] * k_cache.shape[2],
             sinks=sinks,
             window_left=window_left,
-            **({"chunk_pages": 1, "num_warps": 2} if window_left >= 0 else {}),
+            kv_scales=kv8,
+            **_dec_kw,
         )
+        if kv8 is not None and _w8.CHECK and not torch.cuda.is_current_stream_capturing():
+            kc, vc, nbt = _w8.compact_dequant(k_cache, v_cache, page_table)
+            ref = welm_decode_attention(
+                q.view(B, H, D), kc, vc, nbt, cache_seqlens,
+                softmax_scale if softmax_scale is not None else D**-0.5,
+                page_table.shape[1] * k_cache.shape[2], sinks=sinks, window_left=window_left,
+                **({"chunk_pages": 1, "num_warps": 2} if window_left >= 0 else {}),
+            )
+            _w8.report(f"decode w{window_left}", out, ref)
         return out.view(B, 1, H, D)
     if _is_hcu:
         q, softmax_scale = _hcu_prescale_q_for_paged_attention(q, softmax_scale)
@@ -396,6 +434,23 @@ def vllm_flash_attn_with_kvcache(
         s_aux=sinks,
         num_splits=num_splits,
     )
+
+
+def _welm_kv_fp8_registered(k_cache):
+    if k_cache is None or k_cache.dtype != torch.float8_e4m3fn:
+        return False
+    from sglang.srt.layers.attention import welm_kv_fp8
+
+    return k_cache.data_ptr() in welm_kv_fp8._by_ptr
+
+
+def _welm_kv_fp8(k_cache):
+    """(k_scale, v_scale) when k_cache is a WeLM fp8_e4m3 KV buffer, else None."""
+    if k_cache is None or k_cache.dtype != torch.float8_e4m3fn:
+        return None
+    from sglang.srt.layers.attention import welm_kv_fp8
+
+    return welm_kv_fp8.scales_for(k_cache)
 
 
 # Set by models that already folded softmax_scale / sqrt(1/head_dim) into q
@@ -421,6 +476,13 @@ _WELM_PA_MTP = get_bool_env_var("WELM_PA_MTP", default="true")
 _WELM_DEC_ATTN_MAX_BS = int(os.environ.get("WELM_DEC_ATTN_MAX_BS", "0"))
 # Sliding-window decode rows use welm_decode_attention up to this batch size.
 _WELM_DEC_ATTN_SWA_MAX_BS = int(os.environ.get("WELM_DEC_ATTN_SWA_MAX_BS", "24"))
+# HIP mmac decode kernel (layers/welm_hip_dec.py): "fp8" = fp8 KV only,
+# "all" = also bf16 KV (replaces the vendor paged kernel and Triton SWA decode).
+_WELM_HIP_DEC = os.environ.get("WELM_HIP_DEC", "")
+# Head-wise output gate (T, H) handed down by welmv4 for decode; the HIP decode
+# reduce applies sigmoid(gate) and sets WELM_OUT_GATE_DONE.
+WELM_OUT_GATE = None
+WELM_OUT_GATE_DONE = False
 
 
 def _hcu_paged_attention_covers(num_blocks, page_size, num_seqs, max_len):
@@ -453,25 +515,31 @@ def _use_welm_decode_attention(
     if not _WELM_DEC_ATTN or page_table is None or return_softmax_lse or softcap:
         return False
     windowed = window_size is not None and tuple(window_size) != (-1, -1)
+    fp8_kv = k_cache.dtype == torch.float8_e4m3fn
     if windowed and not (
         window_size[0] >= 0
         and window_size[1] in (0, -1)
-        and q.shape[0] <= _WELM_DEC_ATTN_SWA_MAX_BS
+        # fp8 KV has no vendor fallback, so any batch size runs here
+        and (q.shape[0] <= _WELM_DEC_ATTN_SWA_MAX_BS or fp8_kv or _WELM_HIP_DEC == "all")
     ):
         return False
     if q.dim() != 4 or q.shape[1] != 1 or q.dtype != torch.bfloat16:
         return False
-    if k_cache.dtype != torch.bfloat16 or k_cache.dim() != 4 or v_cache.dim() != 4:
+    if k_cache.dim() != 4 or v_cache.dim() != 4:
+        return False
+    fp8 = k_cache.dtype == torch.float8_e4m3fn and v_cache.dtype == k_cache.dtype
+    if k_cache.dtype != torch.bfloat16 and not fp8:
         return False
     # HCU legacy layout: K [blocks, KVH, PAGE, D], V [blocks, KVH, D, PAGE].
     page, d = k_cache.shape[2], k_cache.shape[3]
     if tuple(v_cache.shape[2:]) != (d, page) or q.shape[3] != d:
         return False
     bs = q.shape[0]
-    if windowed:
-        # The vendor kernel runs one workgroup per row for a short window.
+    if windowed or fp8:
+        # The vendor kernel runs one workgroup per row for a short window;
+        # the vendor fp8 path does not support head_dim 256.
         return True
-    if bs <= _WELM_DEC_ATTN_MAX_BS:
+    if bs <= _WELM_DEC_ATTN_MAX_BS or _WELM_HIP_DEC == "all":
         return True
     return not _hcu_paged_attention_covers(
         k_cache.shape[0], page, bs, page_table.shape[1] * page
@@ -592,7 +660,7 @@ def flash_attn_varlen_func(
     return _apply_flash_attn_varlen_out(result, out, return_softmax_lse)
 
 
-def _hcu_paged_prefill_no_sync(
+def _hcu_paged_prefill_no_sync_impl(
     q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
     softmax_scale, causal, window_size, block_table, total_k, sinks,
     return_softmax_lse=False, out=None, host_seq_lens=None,
@@ -608,10 +676,19 @@ def _hcu_paged_prefill_no_sync(
 
     workspace_tokens = max(int(total_k), 256 * 1024)
     nheads_kv = k.shape[1]
-    kt = torch.empty((workspace_tokens, nheads_kv, q.shape[-1]), device=q.device, dtype=k.dtype)
-    vt = torch.empty((workspace_tokens, nheads_kv, v.shape[-2]), device=q.device, dtype=v.dtype)
+    kv8 = _welm_kv_fp8(k)
+    from sglang.srt.layers.attention import welm_kv_fp8 as _w8; _w8.trace("prefill_no_sync", q.shape, k.dtype, kv8)
+    kt = torch.empty((workspace_tokens, nheads_kv, q.shape[-1]), device=q.device, dtype=q.dtype if kv8 else k.dtype)
+    vt = torch.empty((workspace_tokens, nheads_kv, v.shape[-2]), device=q.device, dtype=q.dtype if kv8 else v.dtype)
     cu_k = torch.empty_like(cu_seqlens_q)
-    if (
+    if kv8 is not None:
+        # fp8 cache: dequantize while gathering, then the bf16 kernels below.
+        from sglang.srt.layers.welmv4_fast_op import welm_pagedkv_to_contiguous
+
+        welm_pagedkv_to_contiguous(
+            kt, vt, k, v, block_table, seqused_k, cu_k, max_seqlen_k, kv_scales=kv8
+        )
+    elif (
         _WELM_FAST_P2C
         and k.dtype == torch.bfloat16
         and k.dim() == 4
@@ -744,8 +821,10 @@ def _can_use_hcu_prefill_no_sync(q, k, v, max_seqlen_q, block_table, seqused_k,
         and seqused_k is not None
         and max_seqlen_q >= 16
         and q.dtype in (torch.bfloat16, torch.float16)
-        and k.dtype == q.dtype
-        and v.dtype == q.dtype
+        and (
+            (k.dtype == q.dtype and v.dtype == q.dtype)
+            or (q.dtype == torch.bfloat16 and k.dtype == v.dtype == torch.float8_e4m3fn)
+        )
         and k.dim() == 4
         and k.shape[-2] == 64
         and q.shape[-1] == v.shape[-2]
@@ -835,6 +914,8 @@ def vllm_flash_attn_varlen_func(
         and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         and window_size is not None
         and window_size[0] >= 0
+        # WeLM fp8 KV (static per-layer scales, sinks) uses the WeLM paths.
+        and not _welm_kv_fp8_registered(k)
     )
     # The dedicated model switch isolates vendor-specific behavior. The block
     # size comes from published service configuration, including its alias.
@@ -1077,18 +1158,34 @@ def vllm_flash_attn_varlen_func(
             or torch.cuda.is_current_stream_capturing()
         )
         and q.dtype == torch.bfloat16
-        and k.dtype == v.dtype == torch.bfloat16
+        and k.dtype == v.dtype
+        and k.dtype in (torch.bfloat16, torch.float8_e4m3fn)
         and q_descale is None
         and k.dim() == 4
         and q.shape[1] % k.shape[1] == 0
     ):
         from sglang.srt.layers.welmv4_fast_op import welm_prefix_attention
 
-        return welm_prefix_attention(
+        from sglang.srt.layers.attention import welm_kv_fp8 as _w8; _w8.trace("prefix", q.shape, k.dtype, max_seqlen_q)
+        _pfx_fn = welm_prefix_attention
+        if _WELM_HIP_DEC and k.dtype == torch.float8_e4m3fn and q.shape[-1] == 256 and q.stride(-1) == 1:
+            from sglang.srt.layers import welm_hip_dec
+
+            _pfx_fn = welm_hip_dec.hip_prefix
+        _res = _pfx_fn(
             q, k, v, block_table, seqused_k, cu_seqlens_q, max_seqlen_q,
             softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
-            sinks=sinks, out=out,
+            sinks=sinks, out=out, kv_scales=_welm_kv_fp8(k),
         )
+        if k.dtype == torch.float8_e4m3fn and _w8.CHECK and not torch.cuda.is_current_stream_capturing():
+            kc, vc, nbt = _w8.compact_dequant(k, v, block_table)
+            ref = welm_prefix_attention(
+                q, kc, vc, nbt, seqused_k, cu_seqlens_q, max_seqlen_q,
+                softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5,
+                sinks=sinks,
+            )
+            _w8.report("prefix", _res, ref)
+        return _res
 
     # The HCU paged "MTP" branch (selected for uniform 1 < max_seqlen_q < 16
     # batches) folds query tokens into heads and rejects or ignores
@@ -1109,13 +1206,14 @@ def vllm_flash_attn_varlen_func(
         and seqused_k is not None
         and q.shape[0] == (cu_seqlens_q.shape[0] - 1) * max_seqlen_q
         and q.dtype in (torch.float16, torch.bfloat16)
-        and k.dtype == q.dtype
+        and (k.dtype == q.dtype or k.dtype == torch.float8_e4m3fn)
     ):
         n = max_seqlen_q
         bs = cu_seqlens_q.shape[0] - 1
         if (
             _WELM_PA_MTP
             and q.dtype == torch.bfloat16
+            and k.dtype == q.dtype
             and k.dim() == 4
             and q.shape[1] * n <= k.shape[1] * 64
             # The multi-token mode applies per-folded-head sinks only for
@@ -1190,6 +1288,12 @@ def vllm_flash_attn_varlen_func(
                 softmax_scale, causal, window_size, block_table, total_k_hint,
                 None, return_softmax_lse=True,
             )
+        elif k.dtype == torch.float8_e4m3fn:
+            raise RuntimeError(
+                "fp8_e4m3 KV: unsupported sliding-window prefill call "
+                f"(q {tuple(q.shape)}, max_q {max_seqlen_q}, window {window_size}, "
+                f"total_k_hint {total_k_hint})"
+            )
         else:
             result, lse = vllm_flash_attn_varlen_func_interface(
                 q=q,
@@ -1222,6 +1326,12 @@ def vllm_flash_attn_varlen_func(
             softmax_scale, causal, window_size, block_table, total_k_hint,
             sinks, out=out, host_seq_lens=host_seq_lens,
         )
+    if _is_hcu and k.dtype == torch.float8_e4m3fn and q.shape[-1] != 128:
+        raise RuntimeError(
+            "fp8_e4m3 KV: no HCU varlen kernel for this call "
+            f"(q {tuple(q.shape)}, max_q {max_seqlen_q}, window {window_size}, "
+            f"layout {layout}, total_k_hint {total_k_hint})"
+        )
     # Capture may leave the host bound at zero; live lengths remain on GPU.
     return vllm_flash_attn_varlen_func_interface(
         q=q,
@@ -1241,3 +1351,22 @@ def vllm_flash_attn_varlen_func(
         v_descale=v_descale,
         s_aux=sinks,
     )
+
+
+def _hcu_paged_prefill_no_sync(q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
+                               softmax_scale, causal, window_size, block_table, total_k, sinks,
+                               *args, **kwargs):
+    res = _hcu_paged_prefill_no_sync_impl(
+        q, k, v, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
+        softmax_scale, causal, window_size, block_table, total_k, sinks, *args, **kwargs)
+    from sglang.srt.layers.attention import welm_kv_fp8 as _w8
+    if k.dtype == torch.float8_e4m3fn and _w8.CHECK and not torch.cuda.is_current_stream_capturing():
+        kc, vc, nbt = _w8.compact_dequant(k, v, block_table)
+        kw = dict(kwargs); kw.pop("out", None)
+        ref = _hcu_paged_prefill_no_sync_impl(
+            q, kc, vc, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k,
+            softmax_scale, causal, window_size, nbt, total_k, sinks, *args, **kw)
+        o = res[0] if isinstance(res, tuple) else res
+        r = ref[0] if isinstance(ref, tuple) else ref
+        _w8.report(f"prefill_no_sync w{window_size}", o, r)
+    return res
