@@ -2,7 +2,10 @@
 
 Same contract as welmv4_fast_op.welm_decode_attention for D=256, PAGE=64,
 G<=16, bf16 or fp8 e4m3 KV. fp8 KV uses the cooperative fp8-mmac partial kernel
-(mode 3, q and P split into fp8 hi/lo); partials are merged by a HIP reduce kernel."""
+(mode 3, q and P split into fp8 hi/lo); partials are merged by a HIP reduce kernel.
+
+libwelm_hip_dec.so is not tracked (git-ignored); build it on the target machine with
+`bash welm_hip_dec_build.sh` (needs /opt/dtk hipcc, gfx938)."""
 import ctypes, os
 import torch, triton
 
@@ -14,7 +17,10 @@ _P, _I, _L = ctypes.c_void_p, ctypes.c_int, ctypes.c_long
 def _lib():
     global _LIB
     if _LIB is None:
-        _LIB = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "libwelm_hip_dec.so"))
+        so = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libwelm_hip_dec.so")
+        if not os.path.exists(so):
+            raise RuntimeError(f"{so} not found: WELM_HIP_DEC is set, run `bash welm_hip_dec_build.sh` in {os.path.dirname(so)}")
+        _LIB = ctypes.CDLL(so)
         _LIB.welm_dec_partial_launch.restype = ctypes.c_int
         _LIB.welm_dec_reduce_launch.restype = ctypes.c_int
         _LIB.welm_pfx_partial_launch.restype = ctypes.c_int
