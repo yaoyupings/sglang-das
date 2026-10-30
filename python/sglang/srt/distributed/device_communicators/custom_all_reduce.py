@@ -446,6 +446,21 @@ def dispatch_custom_allreduce(
         class GraphSafeAiterCustomAllreduce(AiterCustomAllreduce):
             """Run real collectives during graph warmup, before HIP capture."""
 
+            def all_reduce(self, inp, *, out=None, use_new=True, open_fp8_quant=False, registered_input=False):
+                from sglang.srt.layers import welm_ar_pool
+
+                if welm_ar_pool.is_pool(self, inp) and inp.is_contiguous():
+                    # Producer wrote into the IPC-registered input pool: no copy-in.
+                    import aiter as _aops
+
+                    if out is None:
+                        out = torch.empty_like(inp)
+                    _aops.all_reduce(self._ptr, inp, out, use_new, open_fp8_quant, 0, 0)
+                    return out
+                return super().all_reduce(
+                    inp, out=out, use_new=use_new, open_fp8_quant=open_fp8_quant, registered_input=registered_input
+                )
+
             def _needs_real_graph_warmup(self) -> bool:
                 return (
                     get_bool_env_var(

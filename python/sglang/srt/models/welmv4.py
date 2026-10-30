@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+from sglang.srt.layers import welm_ar_pool
+from sglang.srt.layers import welm_arn
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
@@ -1292,6 +1294,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if not getattr(Qwen2MoeSparseMoeBlock, "_mss_logged", False):
                 Qwen2MoeSparseMoeBlock._mss_logged = True
                 logger.info("WELM_MOE_SUM_SHARED: shared expert added inside moe_sum")
+        self._arn_off = (
+            welm_arn.region_off(2, hidden_states.shape[0] * hidden_states.shape[-1] * 2)
+            if getattr(self, "_arn_defer", False) and welm_arn.ready()
+            else 0
+        )
+        if (
+            "shared_output" in moe_kwargs
+            and self.tp_size > 1
+            and not use_reduce_scatter
+            and not self.use_a2a
+            and not dump_this_layer
+        ):
+            welm_ar_pool.arm(self._arn_off)
         if prequant is not None and prequant[0].shape[0] == num_tokens:
             if not getattr(Qwen2MoeSparseMoeBlock, "_nq_logged", False):
                 Qwen2MoeSparseMoeBlock._nq_logged = True
@@ -1309,6 +1324,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 if shared_output is not None
                 else None,
             )
+        welm_ar_pool.disarm()
         final_hidden_states = experts_output
         self.last_final_experts_output = None
         self.last_final_shared_output = None
@@ -1325,7 +1341,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)
-        if self.tp_size > 1 and not use_reduce_scatter and not self.use_a2a:
+        if (
+            welm_arn.ENABLED
+            and getattr(self, "_arn_defer", False)
+            and self.tp_size > 1
+            and not use_reduce_scatter
+            and not self.use_a2a
+            and not return_components
+            and welm_ar_pool.is_pool_tensor(final_hidden_states, self._arn_off)
+        ):
+            welm_arn.set_pending(final_hidden_states)
+        elif self.tp_size > 1 and not use_reduce_scatter and not self.use_a2a:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
@@ -2160,7 +2186,28 @@ class Qwen2MoeAttention(nn.Module):
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
-        output, _ = self.o_proj(attn_output)
+        _arp_out = None
+        if (
+            welm_ar_pool.ENABLED
+            and attn_output.dim() == 2
+            and self.o_proj.reduce_results
+            and self.o_proj.tp_size > 1
+            and type(self.o_proj.quant_method).__name__ == "UnquantizedLinearMethod"
+            and getattr(self.o_proj, "bias", None) is None
+        ):
+            _arn_go = getattr(self, "_arn_defer", False) and welm_arn.ready()
+            _shape = (attn_output.shape[0], self.o_proj.weight.shape[0])
+            _arp_out = welm_ar_pool.view(
+                _shape, attn_output.dtype, attn_output.device,
+                off=welm_arn.region_off(1, _shape[0] * _shape[1] * 2) if _arn_go else 0,
+            )
+        if _arp_out is not None and getattr(self, "_arn_defer", False) and welm_arn.ready():
+            output, _ = self.o_proj(attn_output, skip_all_reduce=True, output_tensor=_arp_out)
+            welm_arn.set_pending(output)
+        elif _arp_out is not None:
+            output, _ = self.o_proj(attn_output, output_tensor=_arp_out)
+        else:
+            output, _ = self.o_proj(attn_output)
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
@@ -2338,12 +2385,25 @@ class Qwen2MoeDecoderLayer(nn.Module):
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
         use_dp_layer_communicator = is_dp_attention_enabled()
+        _arn_in = welm_arn.ENABLED and welm_arn.take_pending(hidden_states)
+        if _arn_in and not (
+            residual_after_layernorm
+            and not use_dp_layer_communicator
+            and residual is not None
+            and welm_arn.supported(hidden_states, residual, self.input_layernorm.weight)
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            _arn_in = False
         if use_dp_layer_communicator:
             hidden_states, residual = self.layer_communicator.prepare_attn(
                 hidden_states, residual, forward_batch
             )
             if residual_after_layernorm:
                 residual = hidden_states.to(torch.float32)
+        elif _arn_in:
+            hidden_states, _, residual = welm_arn.ar_input_norm(
+                hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps
+            )
         elif residual_after_layernorm:
             hidden_states, _, residual = self.input_layernorm(
                 hidden_states,
@@ -2367,6 +2427,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if residual is not None:
                 _welm_dump_tensor(f"model.layers.{self.layer_id}.attn.mixer.1", residual)
         use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
+        if welm_arn.ENABLED:
+            self.self_attn._arn_defer = (
+                use_mmq_norm_after_attn
+                and not use_dp_layer_communicator
+                and forward_batch.forward_mode.is_decode()
+                and not dump_this_layer
+                and residual is not None
+                and welm_arn.ready()
+            )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -2375,6 +2444,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 skip_o_norm=use_mmq_norm_after_attn,
                 kv_mirror_states=kv_mirror_states,
             )
+        _arn_att = welm_arn.ENABLED and welm_arn.take_pending(hidden_states)
+        if _arn_att and not welm_arn.supported(
+            hidden_states, residual, self.self_attn.o_norm.weight, self.post_attention_layernorm.weight
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            _arn_att = False
         if (
             forward_batch.enable_kv_mirror
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -2496,7 +2571,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     torch.empty(hidden_states.shape, dtype=torch.float8_e4m3fn, device=hidden_states.device),
                     torch.empty((hidden_states.shape[0], 1), dtype=torch.float32, device=hidden_states.device),
                 )
-            hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
+            hidden_states, residual, hidden_states_fp32 = (welm_arn.ar_norm_after_attn if _arn_att else mmq_style_norm_after_attn)(
                 hidden_states,
                 residual,
                 self.self_attn.o_norm.weight,
@@ -2896,6 +2971,18 @@ class Qwen2MoeModel(nn.Module):
                     )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
+                    if welm_arn.ENABLED:
+                        welm_arn.setup()
+                        nxt = self.layers[i + 1] if i + 1 < self.end_layer else None
+                        layer.mlp._arn_defer = (
+                            nxt is not None
+                            and getattr(nxt, "ppln", False)
+                            and nxt.layer_id not in nxt.prenorm_layer_idx
+                            and forward_batch.forward_mode.is_decode()
+                            and not is_dp_attention_enabled()
+                            and (i + 1) not in self.layers_to_capture
+                            and welm_arn.ready()
+                        )
                     hidden_states, residual, kv_mirror_states = layer(
                         positions,
                         hidden_states,
@@ -2903,6 +2990,8 @@ class Qwen2MoeModel(nn.Module):
                         residual,
                         kv_mirror_states,
                     )
+        if welm_arn.ENABLED and welm_arn.take_pending(hidden_states):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         _set_welm_kv_mirror_states(forward_batch, kv_mirror_states)
         if not self.pp_group.is_last_rank:
             proxy_tensors = {

@@ -492,7 +492,11 @@ def fused_experts_impl_int8_marlin_minimax_m2(
     else:
         raise ValueError(f"Unsupported compute_type: {adtype}")
 
-    out_hidden_states = torch.empty((num_tokens, K), device=adevice, dtype=adtype)
+    from sglang.srt.layers import welm_ar_pool as _arp
+
+    out_hidden_states = _arp.take((num_tokens, K), adtype, adevice) if num_tokens <= CHUNK_SIZE else None
+    if out_hidden_states is None:
+        out_hidden_states = torch.empty((num_tokens, K), device=adevice, dtype=adtype)
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (

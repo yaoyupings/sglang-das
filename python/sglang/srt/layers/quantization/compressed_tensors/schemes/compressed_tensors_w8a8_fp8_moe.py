@@ -592,7 +592,25 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w2 = layer.w2_weight
             w1_shape = w1.shape
             w2_shape = w2.shape
-            if w1.is_cuda and w2.is_cuda:
+            from sglang.srt.layers.moe import welm_w4a8
+
+            if welm_w4a8.ENABLED and w1.is_cuda and w2.is_cuda and not self.use_deepep:
+                from torch.nn.parameter import Parameter
+
+                q1, s1 = welm_w4a8.requant(w1.data, layer.w13_weight_scale.data)
+                q2, s2 = welm_w4a8.requant(w2.data, layer.w2_weight_scale.data)
+                del w1, w2
+                layer.w13_weight = Parameter(q1, requires_grad=False)
+                layer.w2_weight = Parameter(q2, requires_grad=False)
+                layer.w13_weight_scale = Parameter(s1, requires_grad=False)
+                layer.w2_weight_scale = Parameter(s2, requires_grad=False)
+                layer._welm_w4a8 = True
+                layer._w8a8_fp8_packed = True
+                torch.cuda.empty_cache()
+                if not getattr(welm_w4a8, "_logged", False):
+                    welm_w4a8._logged = True
+                    logger.info("WELM_MOE_W4A8: routed experts requantized fp8 -> int4 (aiter moe_c W4A8)")
+            elif w1.is_cuda and w2.is_cuda:
                 if w1.dim() != 3 or w2.dim() != 3 or w1.size(0) != w2.size(0):
                     raise RuntimeError("Unexpected MoE weight shapes")
                 twoN, K = w1.size(1), w1.size(2)
@@ -846,6 +864,18 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     block_shape=self.weight_block_size,
                 )
             return self.runner.run(dispatch_output, quant_info)
+        elif _is_hcu and self.use_hcu_fp8_w8a8_moe and getattr(layer, "_welm_w4a8", False):
+            from sglang.srt.layers.moe import welm_w4a8
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids, _ = topk_output
+            assert not moe_runner_config.apply_router_weight_on_input
+            output = welm_w4a8.run(
+                layer, x, topk_weights, topk_ids, bias=bias,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                num_experts=self.moe_runner_config.num_experts,
+            )
+            return StandardCombineInput(hidden_states=output)
         elif _is_hcu and self.use_hcu_fp8_w8a8_moe:
             if getattr(layer.w13_weight, "_w8a8_fp8_packed", False) or getattr(
                 layer.w2_weight, "_w8a8_fp8_packed", False

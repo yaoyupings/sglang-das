@@ -1851,7 +1851,11 @@ def fused_moe_fp8_w8a8(
                 1,
                 cuda_config2,
             ).view(-1, topk, k)
-        output = hidden_states if inplace else torch.empty_like(hidden_states)
+        from sglang.srt.layers import welm_ar_pool as _arp
+
+        output = _arp.take(hidden_states.shape, hidden_states.dtype, hidden_states.device) if hidden_states.dim() == 2 else None
+        if output is None:
+            output = hidden_states if inplace else torch.empty_like(hidden_states)
 
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
