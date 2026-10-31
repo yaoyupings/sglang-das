@@ -270,6 +270,9 @@ _WELM_FP8_PREFILL = _WELM_FP8_PREFILL_MODE in ("1", "true", "paged")
 # per-tensor fp8 copies of the batch's KV pages; module dir from WELM_FA8_MODDIR.
 _WELM_FP8_PAGED = _WELM_FP8_PREFILL_MODE == "paged"
 _WELM_FP8_MIN_Q = int(__import__("os").environ.get("WELM_FP8_PREFILL_MIN_Q", "1024"))
+# Also run sliding-window (SWA) layers through the fp8 prefix-prefill kernel
+# (its causal-local mode) instead of dequant-gather + bf16 varlen.
+_WELM_FP8_SWA = __import__("os").environ.get("WELM_FP8_SWA_PREFILL", "0") == "1"
 _welm_hg_mod = []
 _WELM_QK_C = {}
 _WELM_FP8_TRITON = __import__("os").environ.get("WELM_FP8_TRITON_QUANT", "1") == "1"
@@ -310,7 +313,10 @@ def _welm_fp8_prefill_ok(q, key_cache, window_size, total_k):
         (_WELM_FP8_PREFILL or _WELM_VARLEN_PREFILL)
         and q.dtype == torch.bfloat16
         and (key_cache.dtype == torch.bfloat16 or (_WELM_FP8_PAGED and key_cache.dtype == torch.float8_e4m3fn))
-        and tuple(window_size) == (-1, -1)
+        and (
+            tuple(window_size) == (-1, -1)
+            or (_WELM_FP8_SWA and _WELM_FP8_PAGED and window_size[0] > 0 and window_size[1] in (0, -1))
+        )
         and isinstance(total_k, int)
         and total_k > 0
         and q.shape[-1] == 256
@@ -329,7 +335,8 @@ def _welm_hg():
 
 
 def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
-                            seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks):
+                            seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks,
+                            window_size=(-1, -1)):
     """fp8 prefix prefill on the legacy layout: gather this batch's KV pages,
     quantize per-tensor (valid tokens only) to bshd e4m3 pages, run the fa_src
     fp8 d256 prefix-prefill kernel. Output bf16 [T, H, D]."""
@@ -379,10 +386,14 @@ def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
     else:
         q8 = (q.float() / qs).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
     out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+    # Sliding window: the kernel only applies a window in its non-causal
+    # "local" mode (left > 0, right = 0 is causal-local, bottom-right aligned).
+    local = window_size is not None and window_size[0] > 0
     hg.hg_prefix_prefill_varlen_fwd(
         q8, k8, v8, out, cu_seqlens_q, None, seqused_k, None, bt,
-        int(max_seqlen_q), int(max_seqlen_k), 0.0, float(scale) * C, False, True,
-        -1, -1, 0.0, False, 1, qs.view(1), ks.view(1), vs.view(1),
+        int(max_seqlen_q), int(max_seqlen_k), 0.0, float(scale) * C, False, not local,
+        int(window_size[0]) if local else -1, 0 if local else -1,
+        0.0, False, 1, qs.view(1), ks.view(1), vs.view(1),
         None if sinks is None else sinks.to(torch.bfloat16).contiguous(), True,
     )
     # fa_src is built with FP8_NO_SCALES: descale ptrs are ignored, so q*k
@@ -391,10 +402,12 @@ def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
 
 
 def _welm_fp8_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
-                      seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks, total_k):
+                      seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks, total_k,
+                      window_size=(-1, -1)):
     if _WELM_FP8_PAGED:
         return _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
-                                       seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks)
+                                       seqused_k, max_seqlen_q, max_seqlen_k, scale, sinks,
+                                       window_size)
     """Prefill attention with the FA HG fp8 d256 varlen kernel (~2x the bf16
     paged kernel): gather the legacy-layout paged KV to contiguous bf16, then
     per-tensor dynamic e4m3 for q/k/v. Output bf16 [T, H, D]."""
@@ -1533,7 +1546,7 @@ class FlashAttentionBackend(AttentionBackend):
                     q2[:t_pre], key_cache, value_cache, page_table[:n_pre],
                     cu_seqlens_q[: n_pre + 1], cache_seqlens[:n_pre], max_seqlen_q,
                     metadata.max_seq_len_k or page_table.shape[1] * self.page_size,
-                    layer.scaling, sinks, total_k,
+                    layer.scaling, sinks, total_k, window_size,
                 )
             if pre8 is not None and _WELM_FP8_PREFILL_CHECK[0] <= 0:
                 pre = pre8
@@ -2011,14 +2024,17 @@ class FlashAttentionBackend(AttentionBackend):
                 and not use_local_attn
                 and not layer.is_cross_attention
                 and self.attn_cp_size == 1
-                and _welm_fp8_prefill_ok(q, key_cache, window_size, forward_batch.seq_lens_sum)
+                and _welm_fp8_prefill_ok(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim), key_cache,
+                    window_size, forward_batch.seq_lens_sum,
+                )
             ):
                 _q3 = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 _mk = metadata.max_seq_len_k or page_table.shape[1] * self.page_size
                 result = _welm_fp8_prefill(
                     _q3, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens,
                     max_seqlen_q, _mk, layer.scaling, kwargs.get("sinks"),
-                    forward_batch.seq_lens_sum,
+                    forward_batch.seq_lens_sum, window_size,
                 )
                 if _WELM_FP8_PREFILL_CHECK[0] > 0:
                     _WELM_FP8_PREFILL_CHECK[0] -= 1

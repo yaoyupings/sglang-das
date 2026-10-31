@@ -15,6 +15,9 @@ import triton
 import triton.language as tl
 
 WELM_TRITON_MOE_DOWN_MIN_M = int(os.environ.get("WELM_TRITON_MOE_DOWN_MIN_M", "0"))
+# Rows (tokens x topk) from which SwiGLU + per-token fp8 quant runs in Triton instead of lightop
+# (2.7x faster at 200k rows; below this the eager launch overhead dominates). 0 = off.
+WELM_TRITON_SILU_QUANT_MIN_ROWS = int(os.environ.get("WELM_TRITON_SILU_QUANT_MIN_ROWS", "8192"))
 
 # (min_m, BM, BN, BK, num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim), largest min_m first.
 # Tuned under CUDA graphs on the marlin-packed TP2 w2 (moedown/mk_graph.py); M < 1024 ties marlin.
@@ -109,3 +112,34 @@ def moe_down_fp8(a, a_scale, w, w_scale, out, topk_weights, sorted_ids, expert_i
         num_warps=nw, num_stages=ns, waves_per_eu=wpe, matrix_instr_nonkdim=nk,
     )
     return out
+
+
+@triton.jit
+def _silu_mul_fp8_quant_kernel(x, o, s, R, D: tl.constexpr, BR: tl.constexpr):
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    m = r < R
+    c = tl.arange(0, D)
+    base = x + r[:, None].to(tl.int64) * (2 * D) + c[None, :]
+    g = tl.load(base, mask=m[:, None], other=0.0).to(tl.float32)
+    u = tl.load(base + D, mask=m[:, None], other=0.0).to(tl.float32)
+    # Same bf16 rounding of silu(g) and of the product as lightop fuse_silu_mul_fp8_quant.
+    y = ((g / (1.0 + tl.exp2(-g * 1.4426950408889634))).to(tl.bfloat16).to(tl.float32) * u)
+    y = y.to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
+    q = tl.clamp(y * (448.0 / amax)[:, None], -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(o + r[:, None].to(tl.int64) * D + c[None, :], q, mask=m[:, None])
+    tl.store(s + r, amax / 448.0, mask=m)
+
+
+def use_triton_silu_quant(x) -> bool:
+    return (0 < WELM_TRITON_SILU_QUANT_MIN_ROWS <= x.shape[0] and x.dim() == 2 and x.is_contiguous()
+            and x.dtype == torch.bfloat16 and x.shape[1] in (256, 512, 1024))
+
+
+def silu_mul_fp8_quant(x):
+    """x [R, 2D] bf16 (gate | up) -> (fp8 e4m3 [R, D], fp32 scale [R, 1])."""
+    R, D = x.shape[0], x.shape[1] // 2
+    o = torch.empty(R, D, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty(R, 1, dtype=torch.float32, device=x.device)
+    _silu_mul_fp8_quant_kernel[(triton.cdiv(R, 16),)](x, o, s, R, D=D, BR=16, num_warps=4)
+    return o, s

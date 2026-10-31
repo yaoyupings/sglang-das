@@ -1815,11 +1815,19 @@ def fused_moe_fp8_w8a8(
         )
         from lightop.activation import fuse_silu_mul_fp8_quant
 
-        fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
-            intermediate_cache1, fp8type=0
+        from sglang.srt.layers.moe.welm_moe_down import (
+            moe_down_fp8,
+            silu_mul_fp8_quant,
+            use_triton_down,
+            use_triton_silu_quant,
         )
 
-        from sglang.srt.layers.moe.welm_moe_down import moe_down_fp8, use_triton_down
+        if use_triton_silu_quant(intermediate_cache1):
+            fp8_cache2, fp8_cache2_scale = silu_mul_fp8_quant(intermediate_cache1)
+        else:
+            fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
+                intermediate_cache1, fp8type=0
+            )
 
         if getattr(w2, "_welm_triton_down", False) and use_triton_down(m, block_size_m):
             # Larger M: Triton fp8 down reading the marlin-packed w2 (faster than marlin here).

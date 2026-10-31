@@ -248,6 +248,7 @@ def _welm_qk_norm_rope_kernel(
     k_inv=1.0,
     v_inv=1.0,
     QUANT_KV: tl.constexpr = False,
+    ROW_DIV: tl.constexpr = 1,
 ):
     t = tl.program_id(0)
     HALF: tl.constexpr = ROPE_DIM // 2
@@ -262,7 +263,10 @@ def _welm_qk_norm_rope_kernel(
     # ---- k ----
     kh = tl.arange(0, KH_B)
     kmask = kh[:, None] < KH
-    kbase = k_ptr + t.to(tl.int64) * k_stride + kh[:, None] * HEAD_DIM
+    # ROW_DIV: the fused qkvg row stride (e.g. 3596) is a multiple of 4 but
+    # not of 16, so Triton cannot specialise it; without the hint the row
+    # loads are scalarised (~3.5x slower at prefill sizes).
+    kbase = k_ptr + tl.multiple_of(t.to(tl.int64) * k_stride, ROW_DIV) + kh[:, None] * HEAD_DIM
     obase = k_out_ptr + t.to(tl.int64) * (KH * HEAD_DIM) + kh[:, None] * HEAD_DIM
     kx = tl.load(kbase + d[None, :], mask=kmask, other=0.0).to(tl.float32)
     k1 = tl.load(kbase + NOPE + dh[None, :], mask=kmask, other=0.0).to(tl.float32)
@@ -304,7 +308,7 @@ def _welm_qk_norm_rope_kernel(
     # ---- q ----
     qh = tl.arange(0, QH_B)
     qmask = qh[:, None] < QH
-    qbase = q_ptr + t.to(tl.int64) * q_stride + qh[:, None] * HEAD_DIM
+    qbase = q_ptr + tl.multiple_of(t.to(tl.int64) * q_stride, ROW_DIV) + qh[:, None] * HEAD_DIM
     q1 = tl.load(qbase + NOPE + dh[None, :], mask=qmask, other=0.0).to(tl.float32)
     q2 = tl.load(qbase + NOPE + HALF + dh[None, :], mask=qmask, other=0.0).to(tl.float32)
     r1 = (q1 * cos[None, :] - q2 * sin[None, :]).to(out_ty)
@@ -326,6 +330,15 @@ def _welm_qk_norm_rope_kernel(
         tl.store(dst + d[None, :], qn, mask=nmask)
     tl.store(dst + NOPE + dh[None, :], r1, mask=qmask)
     tl.store(dst + NOPE + HALF + dh[None, :], r2, mask=qmask)
+
+
+def _row_div(*ts):
+    """Largest of 8/4/2/1 dividing every row stride and element offset (in
+    elements) of the given 2-D row views, for tl.multiple_of row hints."""
+    for div in (8, 4, 2):
+        if all(t.stride(0) % div == 0 and (t.data_ptr() // t.element_size()) % div == 0 for t in ts):
+            return div
+    return 1
 
 
 def welm_qk_norm_rope(
@@ -401,6 +414,7 @@ def welm_qk_norm_rope(
         k_inv=1.0 / kv_scales[0] if kv_store is not None and kv_scales is not None else 1.0,
         v_inv=1.0 / kv_scales[1] if kv_store is not None and kv_scales is not None else 1.0,
         QUANT_KV=kv_store is not None and kv_scales is not None,
+        ROW_DIV=_row_div(q, k, *(kv_store[:1] if kv_store is not None else ())),
         num_warps=4,
     )
     return (k_out, q_out) if return_q else k_out
@@ -449,6 +463,40 @@ def _welm_hcu_store_kv_kernel(
     tl.store(vc_ptr + ((page * H + h) * DV + dv) * P + off, vv)
 
 
+@triton.jit
+def _welm_hcu_store_kv_tiled_kernel(
+    k_ptr, v_ptr, kc_ptr, vc_ptr, loc_ptr, T,
+    k_stride_t, k_stride_h, v_stride_t, v_stride_h,
+    H: tl.constexpr, P: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BT: tl.constexpr,
+    k_inv=1.0, v_inv=1.0, QUANT: tl.constexpr = False, ROW_DIV: tl.constexpr = 1,
+):
+    # BT tokens per program: V is stored as a [DV, BT] tile so consecutive
+    # tokens of a page land in consecutive bytes of each V row.
+    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    h = tl.program_id(1)
+    tm = t < T
+    loc = tl.load(loc_ptr + t, mask=tm, other=0).to(tl.int64)
+    page = loc // P
+    off = loc % P
+    d = tl.arange(0, D)
+    kr = tl.multiple_of(t.to(tl.int64) * k_stride_t, ROW_DIV)
+    kv = tl.load(k_ptr + kr[:, None] + h * k_stride_h + d[None, :], mask=tm[:, None])
+    if QUANT:
+        kv = tl.minimum(tl.maximum(kv.to(tl.float32) * k_inv, -448.0), 448.0)
+    tl.store(kc_ptr + (((page * H + h) * P + off) * D)[:, None] + d[None, :],
+             kv.to(kc_ptr.dtype.element_ty), mask=tm[:, None])
+    dv = tl.arange(0, DV)
+    vr = tl.multiple_of(t.to(tl.int64) * v_stride_t, ROW_DIV)
+    vv = tl.load(v_ptr + vr[None, :] + h * v_stride_h + dv[:, None], mask=tm[None, :])
+    if QUANT:
+        vv = tl.minimum(tl.maximum(vv.to(tl.float32) * v_inv, -448.0), 448.0)
+    tl.store(vc_ptr + ((page * H + h) * DV * P + off)[None, :] + dv[:, None] * P,
+             vv.to(vc_ptr.dtype.element_ty), mask=tm[None, :])
+
+
+_WELM_STORE_KV_TILED_MIN_T = int(os.environ.get("WELM_STORE_KV_TILED_MIN_T", "256"))
+
+
 def welm_hcu_store_kv(cache_k, cache_v, k_buffer, v_buffer, loc, kv_scales=None):
     """cache_k: (T, H, D) / (T, H*D); k_buffer (pages, H, P, D); v_buffer (pages, H, DV, P).
     kv_scales=(k_scale, v_scale): quantize into fp8 buffers (real = x8 * scale)."""
@@ -460,6 +508,19 @@ def welm_hcu_store_kv(cache_k, cache_v, k_buffer, v_buffer, loc, kv_scales=None)
     ck = cache_k.view(cache_k.shape[0], H, D)
     cv = cache_v.view(cache_v.shape[0], H, DV)
     assert ck.stride(2) == 1 and cv.stride(2) == 1
+    if 0 < _WELM_STORE_KV_TILED_MIN_T <= T and ck.stride(1) % 4 == 0 and cv.stride(1) % 4 == 0:
+        BT = 32
+        _welm_hcu_store_kv_tiled_kernel[(triton.cdiv(T, BT), H)](
+            ck, cv, k_buffer, v_buffer, loc, T,
+            ck.stride(0), ck.stride(1), cv.stride(0), cv.stride(1),
+            H=H, P=P, D=D, DV=DV, BT=BT,
+            k_inv=1.0 / kv_scales[0] if kv_scales is not None else 1.0,
+            v_inv=1.0 / kv_scales[1] if kv_scales is not None else 1.0,
+            QUANT=kv_scales is not None,
+            ROW_DIV=_row_div(ck, cv),
+            num_warps=4,
+        )
+        return
     _welm_hcu_store_kv_kernel[(T, H)](
         ck,
         cv,
