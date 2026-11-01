@@ -48,7 +48,8 @@ def hip_decode(q, k_cache, v_cache, block_table, seq_lens, softmax_scale, max_co
     if kv8:
         k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
     if cp is None:
-        cp = 4 if window_left >= 0 else 8
+        configured_cp = int(os.environ.get("WELM_DEC_CP", "0"))
+        cp = configured_cp if configured_cp in (1, 2, 4, 8) else (4 if window_left >= 0 else 8)
     max_splits = triton.cdiv(max_context_len, cp * PAGE)
     gs = min(max_splits, triton.cdiv(window_left + 1, cp * PAGE) + 1) if window_left >= 0 else max_splits
     mid_o = torch.empty((B, H, gs, D), dtype=torch.float32, device=q.device)

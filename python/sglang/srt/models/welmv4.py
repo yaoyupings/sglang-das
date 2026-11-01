@@ -1703,7 +1703,13 @@ class Qwen2MoeAttention(nn.Module):
         )
         # Layer-wise config lists are indexed by the global layer id; the NextN
         # (MTP) layer is local layer 0 but sits after the target layers.
-        cfg_layer_idx = layer_idx + total_layer_num if is_nextn else layer_idx
+        # WELM_MTP_LOCAL_WINDOW=1 indexes by the local id like the official tree
+        # (layer 0: full attention) instead of the global id (layer 48: SWA 512).
+        cfg_layer_idx = (
+            layer_idx + total_layer_num
+            if is_nextn and not get_bool_env_var("WELM_MTP_LOCAL_WINDOW", "false")
+            else layer_idx
+        )
         if len(sliding_window_size_layerwise) > cfg_layer_idx:
             window = sliding_window_size_layerwise[cfg_layer_idx]
             # Match the HF reference: a window equal to max_position_embeddings

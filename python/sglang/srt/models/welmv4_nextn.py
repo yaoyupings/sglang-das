@@ -368,8 +368,11 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         super().set_embed_and_head(embed, head)
         if self.mtp_head is None:
             return
-        if self._mtp_head_loaded and not torch.equal(
-            self.mtp_head.weight, head.weight
+        # WELM_MTP_TARGET_HEAD=1: always draft with the target lm_head (official tree).
+        if (
+            os.environ.get("WELM_MTP_TARGET_HEAD", "0") != "1"
+            and self._mtp_head_loaded
+            and not torch.equal(self.mtp_head.weight, head.weight)
         ):
             self.lm_head = self.mtp_head
         else:
