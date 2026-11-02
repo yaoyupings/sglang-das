@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 """Request scheduler policy"""
 
 import os
+import time
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -82,6 +83,8 @@ CLIP_MAX_NEW_TOKENS = int(
 IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD = int(
     os.environ.get("IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD", "32")
 )
+# LPM variant: shortest-uncached-first with an age limit in ms (0 = off, default LPM).
+_LPM_SJF_AGE_MS = float(os.environ.get("SGLANG_LPM_SJF_AGE_MS", "0"))
 
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (within the waiting queue) larger than this value,
@@ -396,6 +399,22 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
+        if _LPM_SJF_AGE_MS > 0:
+            # SGLANG_LPM_SJF_AGE_MS: fewest uncached tokens first; requests that waited
+            # longer than the age limit go first in arrival order (bounds TTFT of big prompts).
+            now = time.perf_counter()
+            lim = _LPM_SJF_AGE_MS / 1e3
+
+            def key(r):
+                t = r.time_stats.wait_queue_entry_time or 0.0
+                if t and now - t > lim:
+                    return (0, t)
+                if r.rid in temporary_deprioritized:
+                    return (2, t)
+                return (1, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
+
+            waiting_queue.sort(key=key)
+            return
         waiting_queue.sort(
             key=lambda r: (
                 -r.num_matched_prefix_tokens
