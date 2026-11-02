@@ -281,10 +281,8 @@ _welm_kvq_mod = []
 
 def _welm_kvq():
     if not _welm_kvq_mod:
-        import sys
-        sys.path.insert(0, "/root/welm_opt/fa8")
-        import kvq
-        _welm_kvq_mod.append(kvq)
+        from sglang.srt.layers.attention import welm_kvq
+        _welm_kvq_mod.append(welm_kvq)
     return _welm_kvq_mod[0]
 _WELM_QK_MARGIN = float(__import__("os").environ.get("WELM_FP8_QK_MARGIN", "8"))
 _WELM_FP8_PREFILL_CHECK = [int(__import__("os").environ.get("WELM_FP8_PREFILL_CHECK", "0"))]
@@ -328,7 +326,9 @@ def _welm_fp8_prefill_ok(q, key_cache, window_size, total_k):
 def _welm_hg():
     if not _welm_hg_mod:
         import os, sys
-        sys.path.insert(0, os.environ.get("WELM_FA8_MODDIR", "/root/welm_opt/fa8/mod_pshift"))
+        # fp8 prefix-prefill FA kernel module (P-shift build), shipped in sglang/welm_assets/fa8
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "welm_assets", "fa8")
+        sys.path.insert(0, os.environ.get("WELM_FA8_MODDIR") or os.path.normpath(default))
         import flash_attn_hg_cuda
         _welm_hg_mod.append(flash_attn_hg_cuda)
     return _welm_hg_mod[0]
@@ -356,7 +356,7 @@ def _welm_fp8_paged_prefill(q, key_cache, value_cache, page_table, cu_seqlens_q,
         ks = amax[0:1] / 448.0
         vs = amax[1:2] / 448.0
     elif _WELM_FP8_TRITON:
-        # fused gather + per-tensor e4m3 quant (welm_opt/fa8/kvq.py)
+        # fused gather + per-tensor e4m3 quant (welm_kvq.py)
         kvq = _welm_kvq()
         k8, v8, amax = kvq.gather_quant_kv(key_cache, value_cache, page_table, seqused_k, maxp)
         ks = amax[0:1] / 448.0

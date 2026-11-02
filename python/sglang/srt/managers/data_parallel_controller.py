@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers import welm_page_route
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -176,6 +177,13 @@ class DataParallelController:
         }
         # prefix_affinity: (depth, hash of input_ids[:depth]) -> dp rank, LRU-bounded
         self._prefix_owner = {}
+        # WELM_DP_PAGE_ROUTE=1: exact per-rank prefix routing replaces the depth-keyed owner map
+        self._welm_page_router = (
+            welm_page_route.WelmPageRouter(get_parallel().dp_size)
+            if self.load_balance_method == LoadBalanceMethod.PREFIX_AFFINITY
+            and welm_page_route.enabled()
+            else None
+        )
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
@@ -824,6 +832,8 @@ class DataParallelController:
         if type(req).__name__ == "FlushCacheReqInput":
             self._prefix_owner.clear()
             self._affinity_dispatches = 0
+            if self._welm_page_router is not None:
+                self._welm_page_router.reset()
         return self.send_control_message(req)
 
     _AFFINITY_DEPTHS = (2048, 4096, 6144, 8192, 12288)
@@ -836,6 +846,10 @@ class DataParallelController:
         no affinity: only the deepest matched prefix still below
         SGLANG_DP_AFFINITY_POPULAR requests pins the rank."""
         if self.maybe_external_dp_rank_routing(req):
+            return
+        if self._welm_page_router is not None:
+            target = self._welm_page_router.select(req.input_ids, self.dp_budget)
+            sock_send(self.workers[target], req)
             return
         ids = req.input_ids
         n = len(ids)
