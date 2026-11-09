@@ -40,6 +40,10 @@ def _lib():
         _LIB.welm_arn_launch.restype = ctypes.c_int
         _LIB.welm_arn_launch.argtypes = [_I, _I, _I, _P, _P, _P, _P, _P, _I, _I, _I, _P, _P, _P, _P, _P, _P, _P, _P,
                                          ctypes.c_float, _I, _P]
+        if hasattr(_LIB, "welm_arn_launch_n"):
+            _LIB.welm_arn_launch_n.restype = ctypes.c_int
+            _LIB.welm_arn_launch_n.argtypes = [_I, _I, _I, _I, _P, _P, _P, _I, _I, _I, _P, _P, _P, _P, _P, _P, _P,
+                                               _P, ctypes.c_float, _I, _P]
         _HIP = ctypes.CDLL("libamdhip64.so")
         _HIP.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_Handle), _P]
         _HIP.hipIpcOpenMemHandle.argtypes = [ctypes.POINTER(_P), _Handle, ctypes.c_uint]
@@ -68,7 +72,10 @@ def _ca():
     from sglang.srt.layers import welm_ar_pool
 
     ca = welm_ar_pool._ca()
-    if ca is None or ca.world_size != 2:
+    # TP4 needs the generic kernel (welm_arn_launch_n) and WELM_ARN_TP4=1.
+    if ca is None or ca.world_size not in (2, 4):
+        return None
+    if ca.world_size == 4 and (os.environ.get("WELM_ARN_TP4", "0") != "1" or not hasattr(_lib(), "welm_arn_launch_n")):
         return None
     return ca
 
@@ -98,22 +105,23 @@ def setup(ca=None):
         mine = (_ipc_handle(pool), _ipc_handle(sig))
     except Exception as e:  # noqa: BLE001
         err, mine = repr(e), None
-    allh = [None, None]
+    nr = ca.world_size
+    allh = [None] * nr
     dist.all_gather_object(allh, (err, mine), group=ca.group)
     if any(a[0] for a in allh):
         logger.warning("WELM_ARN disabled: %s", [a[0] for a in allh])
         _ST = False
         return
     rank = ca.rank
-    pools, sigs = [0, 0], [0, 0]
-    for r in range(2):
+    pools, sigs = [0] * nr, [0] * nr
+    for r in range(nr):
         if r == rank:
             pools[r], sigs[r] = pool, sig
         else:
             pools[r], sigs[r] = _ipc_open(allh[r][1][0]), _ipc_open(allh[r][1][1])
     torch.cuda.synchronize()
     dist.barrier(group=ca.group)
-    _ST = dict(rank=rank, pool=pools, sig=sigs)
+    _ST = dict(rank=rank, pool=pools, sig=sigs, nr=nr)
     logger.info("WELM_ARN: fused AR+norm ready (rank %d)", rank)
 
 
@@ -161,6 +169,19 @@ def _launch(mode, x, g0, g1, res, out, res_out, f32_out, xq, xs, eps):
     off = x.data_ptr() - st["pool"][st["rank"]]
     grid = max(1, min(rows, _MAXB))
     end = 0 if off >= _REGION else 1
+    if st.get("nr", 2) != 2:
+        nr = st["nr"]
+        ins = (_P * nr)(*[st["pool"][q] + off for q in range(nr)])
+        sigs = (_P * nr)(*st["sig"])
+        r = _LIB.welm_arn_launch_n(
+            nr, mode, 1 if xq is not None else 0, grid, ins, sigs, st["sig"][st["rank"]], st["rank"], rows, cols,
+            g0.data_ptr(), g1.data_ptr() if g1 is not None else 0, res.data_ptr(), out.data_ptr(),
+            res_out.data_ptr() if res_out is not None else 0, f32_out.data_ptr(),
+            xq.data_ptr() if xq is not None else 0, xs.data_ptr() if xs is not None else 0, float(eps), end,
+            torch.cuda.current_stream().cuda_stream)
+        if r != 0:
+            raise RuntimeError(f"welm_arn launch failed: {r}")
+        return
     r = _LIB.welm_arn_launch(
         mode, 1 if xq is not None else 0, grid, st["pool"][0] + off, st["pool"][1] + off, st["sig"][0], st["sig"][1],
         st["sig"][st["rank"]], st["rank"], rows, cols, g0.data_ptr(), g1.data_ptr() if g1 is not None else 0,

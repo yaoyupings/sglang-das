@@ -8,6 +8,8 @@ framework).
 | Path | What | Used by |
 |---|---|---|
 | `vendor_fa/` | WeLM-patched vendor flash_attn (dim-256 prefill, partial paged attention) | launcher must put it first on `PYTHONPATH` |
+
+> 2026-11-08: `vendor_fa/flash_attn_2_cuda*.so` is now a **gfx938-only** build of flash-attention-cutlass branch `welm-938d256` (welm + the gfx938 d256 pipeline path from upstream 6d4dcba). The previous gfx928/gfx936/gfx938 build is kept next to it as `*.so.bak_3arch_20261021`; deploy to gfx936 (BW1000) from `welm_bw1000_deploy/`, not from this directory.
 | `fa8/flash_attn_hg_cuda.so` | fp8 prefix-prefill FA kernel (P-shift build) | `flashattention_backend.py` (default for `WELM_FA8_MODDIR`) |
 | `kvfp8/welm_kv_fp8_scales.json` | static per-layer K/V scales for the fp8_e4m3 KV cache | `WELM_KV_FP8_SCALES` |
 | `gemm/tuned_r<N>.csv` | offline TunableOp GEMM picks, one per device ordinal | `PYTORCH_TUNABLEOP_FILENAME` |

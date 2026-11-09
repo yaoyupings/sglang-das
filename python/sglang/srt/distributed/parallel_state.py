@@ -126,6 +126,11 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+# PP proxy entries that differ per TP rank (WeLM KV-mirror K/V shards): send
+# whole per rank instead of the replicated-tensor slice + all-gather.
+_PP_TP_SHARDED_KEY_PREFIXES = ("welm_kv_mirror.",)
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -1927,13 +1932,18 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
+        tensor_keys = [k for k, v in metadata_list if isinstance(v, TensorMetadata)]
+        for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+                and not key.startswith(_PP_TP_SHARDED_KEY_PREFIXES)
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1980,6 +1990,7 @@ class GroupCoordinator:
                 use_all_gather = (
                     all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
+                    and not key.startswith(_PP_TP_SHARDED_KEY_PREFIXES)
                 )
 
                 if use_all_gather:

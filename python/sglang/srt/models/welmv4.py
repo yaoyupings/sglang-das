@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+import types
+
 import torch
 from sglang.srt.layers import welm_ar_pool
 from sglang.srt.layers import welm_arn
@@ -481,11 +483,17 @@ def _set_welm_kv_mirror_states(
 def _pack_welm_kv_mirror_pp_tensor(
     proxy_tensors: Dict[str, Any], key: str, tensor: torch.Tensor
 ) -> None:
-    flat = tensor.contiguous().view(-1)
     try:
         tp_size = get_attention_tp_size()
     except (AssertionError, RuntimeError):
         tp_size = 1
+    if tensor.numel() % max(tp_size, 1) == 0:
+        # TP-sharded: PP send/recv passes "welm_kv_mirror." keys whole per rank
+        # (parallel_state._PP_TP_SHARDED_KEY_PREFIXES); keep [tokens, kv] so
+        # decode CUDA-graph PP buffers slice by tokens.
+        proxy_tensors[key] = tensor.contiguous()
+        return
+    flat = tensor.contiguous().view(-1)
     pad_len = 0
     if tp_size > 1:
         while (flat.numel() + pad_len) % tp_size != 0:
@@ -520,9 +528,22 @@ def _pack_welm_kv_mirror_states(
         )
 
 
+def _welm_pp_localize_mirror(pp_proxy_tensors: PPProxyTensors) -> None:
+    """[tp, tokens, kv] mirror slots from PP recv -> this rank's [tokens, kv]."""
+    t = pp_proxy_tensors.tensors
+    for key in list(t):
+        v = t[key]
+        if key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.") and isinstance(v, torch.Tensor) and v.dim() == 3:
+            if v.shape[0] != get_attention_tp_size():
+                logger.warning("WeLM PP mirror %s unexpected shape %s", key, tuple(v.shape))
+                continue
+            t[key] = v[get_attention_tp_rank()]
+
+
 def _unpack_welm_kv_mirror_states(
     pp_proxy_tensors: PPProxyTensors,
 ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    _welm_pp_localize_mirror(pp_proxy_tensors)
     states = _empty_welm_kv_mirror_states()
     for key, tensor in pp_proxy_tensors.tensors.items():
         if not key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.") or key.endswith(".shape"):
@@ -832,15 +853,17 @@ class LayerManager:
             ]
             # ``decoder_layer`` is keyed by global layer id and may be sparse
             # (per-step MTP draft models register only their own layer).
-            if (
-                mirror_layer_id not in LayerManager.decoder_layer
-                or imitated_layer_id not in LayerManager.decoder_layer
-            ):
+            if mirror_layer_id not in LayerManager.decoder_layer:
+                continue
+            pp_mirror_only = imitated_layer_id not in LayerManager.decoder_layer
+            if pp_mirror_only and get_pp_group().world_size == 1:
                 continue
             mirror_layer_attn = LayerManager.decoder_layer[mirror_layer_id].self_attn
-            imitated_layer_attn = LayerManager.decoder_layer[
-                imitated_layer_id
-            ].self_attn
+            imitated_layer_attn = (
+                mirror_layer_attn
+                if pp_mirror_only
+                else LayerManager.decoder_layer[imitated_layer_id].self_attn
+            )
 
             mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
             mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
@@ -874,6 +897,8 @@ class LayerManager:
             else:
                 mirror_layer_attn.qkv_proj_bias = mirror_q_bias.clone()
 
+            if pp_mirror_only:
+                continue  # PP: the imitated layer lives on an earlier stage
             # Several physical mirror layers may imitate one target layer.
             # Accumulate their K/V projections instead of overwriting the
             # target's projection on every iteration.  The checkpoint's K/V
@@ -2950,6 +2975,19 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
             kv_mirror_states = _unpack_welm_kv_mirror_states(pp_proxy_tensors)
+            # Prefill rows were already cut to one per request by the first
+            # KV-mirror layer on an earlier stage; record the indices here.
+            mirror_layers = getattr(self.config, "kv_mirror_layers", [])
+            if (
+                mirror_layers
+                and forward_batch.enable_kv_mirror
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and forward_batch.custom_last_index is None
+                and self.start_layer > min(mirror_layers)
+            ):
+                forward_batch.custom_last_index = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
 
         aux_hidden_states = []
         # TBO's operation plan only carries hidden/residual.  Mirror state is
@@ -3105,7 +3143,53 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        self._welm_build_pp_mirror_qkv()
         self.post_init_after_load_weights(is_nextn=False)
+
+    def welm_pp_mirror_recv_shapes(self):
+        """PP: mirror K/V activations this stage receives from earlier stages
+        -> {proxy key: kv width}, for static decode CUDA-graph buffers."""
+        if self.pp_group.world_size == 1 or self.pp_group.is_first_rank:
+            return {}
+        m, cfg = self.model, self.config
+        out = {}
+        for mid, iid in zip(getattr(cfg, "kv_mirror_layers", []),
+                            getattr(cfg, "kv_mirror_imitated_layers", [])):
+            if mid < cfg.num_hidden_layers and iid < m.start_layer and mid >= m.start_layer:
+                # Middle PP stages also pass through K/V for later stages.
+                kv = m.layers[m.start_layer].self_attn.kv_size
+                for sfx in ("k", "v"):
+                    out[_welm_kv_mirror_pp_key(mid, sfx)] = kv
+        return out
+
+    def _welm_build_pp_mirror_qkv(self):
+        """PP: an imitated layer (0-15) projects K/V with its mirror layer's
+        (33-47) weights, which live on another PP stage. Load those QKV
+        projections here as stand-alone modules (model.welm_ppmirror.<id>)."""
+        self._welm_ppmirror_ids = set()
+        if self.pp_group.world_size == 1:
+            return
+        m, cfg = self.model, self.config
+        holder = nn.ModuleDict()
+        for mid, iid in zip(getattr(cfg, "kv_mirror_layers", []),
+                            getattr(cfg, "kv_mirror_imitated_layers", [])):
+            if mid >= cfg.num_hidden_layers:
+                continue
+            if not (m.start_layer <= iid < m.end_layer) or m.start_layer <= mid < m.end_layer:
+                continue
+            ref = m.layers[iid].self_attn
+            ph = nn.Module()
+            ph.qkv_proj = QKVParallelLinear(
+                cfg.hidden_size, ref.head_dim, ref.total_num_heads, ref.total_num_kv_heads,
+                bias=False, quant_config=None,
+                tp_rank=get_attention_tp_rank(), tp_size=get_attention_tp_size(),
+                prefix=f"model.welm_ppmirror.{mid}.qkv_proj",
+            )
+            ph.q_size, ph.kv_size = ref.q_size, ref.kv_size
+            holder[str(mid)] = ph
+            LayerManager.set_decoder_layer(mid, types.SimpleNamespace(self_attn=ph))
+            self._welm_ppmirror_ids.add(mid)
+        m.welm_ppmirror = holder
 
     @torch.no_grad()
     def forward(
@@ -3383,6 +3467,15 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     )
             layer_id = get_layer_id(name)
             if (
+                layer_id in getattr(self, "_welm_ppmirror_ids", ())
+                and not is_nextn
+                and any(f".self_attn.{w}_proj." in name for w in "qkv")
+            ):
+                name = name.replace(
+                    f"model.layers.{layer_id}.self_attn.", f"model.welm_ppmirror.{layer_id}."
+                )
+                layer_id = None
+            if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
                 and (
@@ -3511,15 +3604,22 @@ class WeLMV4MoeForCausalLM(nn.Module):
             kv_mirror_layer_ids = [
                 decoder_layer.self_attn.kv_mirror_layer_idx
                 for decoder_layer in self.model.layers
+                if not isinstance(decoder_layer, PPMissingLayer)
             ]
-            kv_mirror_layer_ids = [
-                layer_id
-                for layer_id in total_kv_mirror_layers
-                if layer_id in kv_mirror_layer_ids
-            ]  # keep the order of total_kv_mirror_layers
-            kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
-                -len(kv_mirror_layer_ids) :
-            ]
+            if self.pp_group.world_size > 1:
+                present = set(kv_mirror_layer_ids) | getattr(self, "_welm_ppmirror_ids", set())
+                pairs = dict(zip(total_kv_mirror_layers, total_kv_mirror_imitated_layers))
+                kv_mirror_layer_ids = [l for l in total_kv_mirror_layers if l in present]
+                kv_mirror_imitated_layers = [pairs[l] for l in kv_mirror_layer_ids]
+            else:
+                kv_mirror_layer_ids = [
+                    layer_id
+                    for layer_id in total_kv_mirror_layers
+                    if layer_id in kv_mirror_layer_ids
+                ]  # keep the order of total_kv_mirror_layers
+                kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
+                    -len(kv_mirror_layer_ids) :
+                ]
         LayerManager.post_init(
             kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
         )

@@ -1,4 +1,4 @@
-// WeLM fused 2-rank all-reduce + RMSNorm(s) for TP2 decode (gfx938).
+// WeLM fused 2/4-rank all-reduce + RMSNorm(s) for TP2 decode (gfx938).
 // Inputs: the two ranks' bf16 partial sums in IPC-mapped uncached buffers (the aiter AR input pool),
 // summed in rank order (bitwise identical on both ranks), then per row:
 //   mode 0 (post-attn, mmq_style_norm_after_attn [+ fp8 per-token quant]):
@@ -28,10 +28,13 @@ struct Signal {
     alignas(128) uint32_t flag[MAXB][PAD];
 };
 
-__device__ __forceinline__ void start_sync(Signal* s0, Signal* s1, Signal* self, int rank) {
+struct Ptrs { const __hip_bfloat16* in[4]; Signal* sig[4]; };
+
+template <int NR>
+__device__ __forceinline__ void start_sync(const Ptrs& p, Signal* self, int rank) {
     uint32_t flag = self->flag[blockIdx.x][0] + 1;
-    if (threadIdx.x < 2) {
-        Signal* dst = threadIdx.x == 0 ? s0 : s1;
+    if (threadIdx.x < NR) {
+        Signal* dst = p.sig[threadIdx.x];
         __scoped_atomic_store_n(&dst->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
         while (__scoped_atomic_load_n(&self->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) < flag)
             ;
@@ -40,11 +43,12 @@ __device__ __forceinline__ void start_sync(Signal* s0, Signal* s1, Signal* self,
     if (threadIdx.x == 0) self->flag[blockIdx.x][0] = flag;
 }
 
-__device__ __forceinline__ void end_sync(Signal* s0, Signal* s1, Signal* self, int rank) {
+template <int NR>
+__device__ __forceinline__ void end_sync(const Ptrs& p, Signal* self, int rank) {
     __syncthreads();
     uint32_t flag = self->flag[blockIdx.x][0] + 1;
-    if (threadIdx.x < 2) {
-        Signal* dst = threadIdx.x == 0 ? s0 : s1;
+    if (threadIdx.x < NR) {
+        Signal* dst = p.sig[threadIdx.x];
         __scoped_atomic_store_n(&dst->end[blockIdx.x][rank], flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
         while (__scoped_atomic_load_n(&self->end[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) < flag)
             ;
@@ -118,10 +122,9 @@ __device__ __forceinline__ uint8_t to_e4m3(float x) {
     return sgn | (uint8_t)code;
 }
 
-template <int MODE, bool QUANT, int VPT, bool END>
+template <int MODE, bool QUANT, int VPT, bool END, int NR>
 __global__ void __launch_bounds__(NT, 1) arn_kernel(
-    const __hip_bfloat16* __restrict__ in0, const __hip_bfloat16* __restrict__ in1,
-    Signal* s0, Signal* s1, Signal* self, int rank, int rows, int cols,
+    Ptrs p, Signal* self, int rank, int rows, int cols,
     const __hip_bfloat16* __restrict__ g0, const __hip_bfloat16* __restrict__ g1,
     const float* __restrict__ res, __hip_bfloat16* __restrict__ out, float* __restrict__ res_out,
     float* __restrict__ f32_out, uint8_t* __restrict__ xq, float* __restrict__ xs, float eps) {
@@ -132,8 +135,7 @@ __global__ void __launch_bounds__(NT, 1) arn_kernel(
     const bool act = c0 < cols;
     // Everything that does not depend on the peer is loaded before the barrier: gammas, the residual
     // and this rank's own partial sum of the first row (written by the previous kernel in-stream).
-    const __hip_bfloat16* own = rank == 0 ? in0 : in1;
-    const __hip_bfloat16* peer = rank == 0 ? in1 : in0;
+    const __hip_bfloat16* own = p.in[rank];
     uint4 gw0 = make_uint4(0, 0, 0, 0), gw1 = make_uint4(0, 0, 0, 0);
     uint4 va = make_uint4(0, 0, 0, 0);
     float4 r0 = make_float4(0, 0, 0, 0), r1 = r0;
@@ -151,7 +153,7 @@ __global__ void __launch_bounds__(NT, 1) arn_kernel(
         }
     }
     T(0)
-    start_sync(s0, s1, self, rank);
+    start_sync<NR>(p, self, rank);
     T(1)
     if (!PF && act) {
         gw0 = *(const uint4*)(g0 + c0);
@@ -172,16 +174,27 @@ __global__ void __launch_bounds__(NT, 1) arn_kernel(
         }
         float s[VPT];
         if (act) {
-            uint4 vb = *(const uint4*)(peer + off);
-#ifdef TS
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-#endif
-            T(2)
-            // rank-order sum (in0 + in1) so both ranks are bitwise identical
+            if (NR == 2) {
+                uint4 vb = *(const uint4*)(p.in[rank ^ 1] + off);
+                T(2)
+                // rank-order sum (in0 + in1) so both ranks are bitwise identical
 #pragma unroll
-            for (int j = 0; j < VPT; j++) {
-                float x = bfu(va, j), y = bfu(vb, j);
-                s[j] = rank == 0 ? bf(x + y) : bf(y + x);
+                for (int j = 0; j < VPT; j++) {
+                    float x = bfu(va, j), y = bfu(vb, j);
+                    s[j] = rank == 0 ? bf(x + y) : bf(y + x);
+                }
+            } else {
+                // fp32 sum in rank order 0..NR-1 (same on every rank), one bf16 rounding
+                uint4 v[NR];
+#pragma unroll
+                for (int q = 0; q < NR; q++) v[q] = q == rank ? va : *(const uint4*)(p.in[q] + off);
+#pragma unroll
+                for (int j = 0; j < VPT; j++) {
+                    float a = bfu(v[0], j);
+#pragma unroll
+                    for (int q = 1; q < NR; q++) a += bfu(v[q], j);
+                    s[j] = bf(a);
+                }
             }
         } else {
 #pragma unroll
@@ -277,20 +290,29 @@ __global__ void __launch_bounds__(NT, 1) arn_kernel(
         }
     }
     T(3)
-    if (END) end_sync(s0, s1, self, rank);
+    if (END) end_sync<NR>(p, self, rank);
     T(4)
 }
 
-template <int K>
-__global__ void __launch_bounds__(NT, 1) dbg_kernel(Signal* s0, Signal* s1, Signal* self, int rank) {
-    if (K >= 1) start_sync(s0, s1, self, rank);
-    if (K >= 2) end_sync(s0, s1, self, rank);
-}
 
-extern "C" int welm_arn_dbg(int k, int grid, void* s0, void* s1, void* self, int rank, hipStream_t stream) {
-    if (k == 0) hipLaunchKernelGGL(dbg_kernel<0>, dim3(grid), dim3(NT), 0, stream, (Signal*)s0, (Signal*)s1, (Signal*)self, rank);
-    if (k == 1) hipLaunchKernelGGL(dbg_kernel<1>, dim3(grid), dim3(NT), 0, stream, (Signal*)s0, (Signal*)s1, (Signal*)self, rank);
-    if (k == 2) hipLaunchKernelGGL(dbg_kernel<2>, dim3(grid), dim3(NT), 0, stream, (Signal*)s0, (Signal*)s1, (Signal*)self, rank);
+
+// nr = 2 or 4; ins / sigs: arrays of nr device pointers (rank order).
+extern "C" int welm_arn_launch_n(int nr, int mode, int quant, int grid, void* const* ins, void* const* sigs,
+                               void* self, int rank, int rows, int cols, const void* g0, const void* g1,
+                               const void* res, void* out, void* res_out, void* f32_out, void* xq, void* xs,
+                               float eps, int end, hipStream_t stream) {
+    if (cols > NT * 8 || cols % 8 || grid < 1 || grid > MAXB || (nr != 2 && nr != 4)) return -1;
+    Ptrs p;
+    for (int q = 0; q < 4; q++) { p.in[q] = (const __hip_bfloat16*)ins[q < nr ? q : 0]; p.sig[q] = (Signal*)sigs[q < nr ? q : 0]; }
+#define L(M, Q, E, N) hipLaunchKernelGGL((arn_kernel<M, Q, 8, E, N>), dim3(grid), dim3(NT), 0, stream,                 \
+                                   p, (Signal*)self, rank, rows, cols, (const __hip_bfloat16*)g0,                 \
+                                   (const __hip_bfloat16*)g1, (const float*)res, (__hip_bfloat16*)out,           \
+                                   (float*)res_out, (float*)f32_out, (uint8_t*)xq, (float*)xs, eps)
+#define LN(N) if (end) { if (mode == 0 && quant) L(0, true, true, N); else if (mode == 0) L(0, false, true, N); else L(1, false, true, N); } \
+              else { if (mode == 0 && quant) L(0, true, false, N); else if (mode == 0) L(0, false, false, N); else L(1, false, false, N); }
+    if (nr == 2) { LN(2) } else { LN(4) }
+#undef LN
+#undef L
     return (int)hipGetLastError();
 }
 
@@ -298,25 +320,10 @@ extern "C" int welm_arn_launch(int mode, int quant, int grid, const void* in0, c
                                void* self, int rank, int rows, int cols, const void* g0, const void* g1,
                                const void* res, void* out, void* res_out, void* f32_out, void* xq, void* xs,
                                float eps, int end, hipStream_t stream) {
-    if (cols > NT * 8 || cols % 8 || grid < 1 || grid > MAXB) return -1;
-#define L(M, Q, E) hipLaunchKernelGGL((arn_kernel<M, Q, 8, E>), dim3(grid), dim3(NT), 0, stream,                       \
-                                   (const __hip_bfloat16*)in0, (const __hip_bfloat16*)in1, (Signal*)s0,          \
-                                   (Signal*)s1, (Signal*)self, rank, rows, cols, (const __hip_bfloat16*)g0,      \
-                                   (const __hip_bfloat16*)g1, (const float*)res, (__hip_bfloat16*)out,           \
-                                   (float*)res_out, (float*)f32_out, (uint8_t*)xq, (float*)xs, eps)
-    // end == 0: caller guarantees the inputs live in a region no producer rewrites before the next
-    // fused kernel's start barrier (double-buffered pool regions), so the trailing barrier is skipped.
-    if (end) {
-        if (mode == 0 && quant) L(0, true, true);
-        else if (mode == 0) L(0, false, true);
-        else L(1, false, true);
-    } else {
-        if (mode == 0 && quant) L(0, true, false);
-        else if (mode == 0) L(0, false, false);
-        else L(1, false, false);
-    }
-#undef L
-    return (int)hipGetLastError();
+    void* ins[2] = {(void*)in0, (void*)in1};
+    void* sigs[2] = {s0, s1};
+    return welm_arn_launch_n(2, mode, quant, grid, ins, sigs, self, rank, rows, cols, g0, g1, res, out, res_out,
+                             f32_out, xq, xs, eps, end, stream);
 }
 
 extern "C" int welm_arn_signal_size() { return (int)sizeof(Signal); }

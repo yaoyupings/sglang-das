@@ -203,6 +203,8 @@ def build_replay_fb_view(
     )
 
 
+_welm_pp_localize = None  # WeLM PP: per-rank mirror K/V slot selection
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -436,6 +438,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
         )
+        _welm_pp_extra = getattr(self.model_runner.model, "welm_pp_mirror_recv_shapes", None)
+        global _welm_pp_localize
+        if _welm_pp_extra is not None:
+            from sglang.srt.models.welmv4 import _welm_pp_localize_mirror as _welm_pp_localize
+        if self.pp_size > 1 and _welm_pp_extra is not None:
+            _hs = self.buffers.pp_proxy_tensors["hidden_states"]
+            _res = self.buffers.pp_proxy_tensors.get("residual")
+            if _res is not None:  # WeLM carries an fp32 residual between layers
+                self.buffers.pp_proxy_tensors["residual"] = torch.zeros(
+                    _res.shape, dtype=torch.float32, device=_res.device
+                )
+            for _k, _w in _welm_pp_extra().items():
+                self.buffers.pp_proxy_tensors[_k] = torch.zeros(
+                    (_hs.shape[0], _w), dtype=_hs.dtype, device=_hs.device
+                )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
@@ -1356,6 +1373,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
+        if pp_proxy_tensors is not None and _welm_pp_localize is not None:
+            _welm_pp_localize(pp_proxy_tensors)
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
