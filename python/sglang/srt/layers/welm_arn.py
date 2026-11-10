@@ -5,7 +5,8 @@ The producer (o_proj / fp8 MoE moe_sum) writes its partial sum into the aiter AR
 peer, sums both ranks' pool rows (peer pool IPC-mapped here) and applies
   mode 0: mmq_style_norm_after_attn (o_norm, + residual, post-attn norm, optional fp8 quant)
   mode 1: ppln input_layernorm (+ fp32 residual, rms norm, fp32 copy)
-libwelm_arn.so: hipcc -shared -fPIC -O3 -std=c++17 --offload-arch=gfx938 -fno-gpu-rdc -o libwelm_arn.so welm_arn.hip
+libwelm_arn.so: hipcc -shared -fPIC -O3 -std=c++17 --offload-arch=gfx938 --offload-arch=gfx936 -fno-gpu-rdc -o libwelm_arn.so welm_arn.hip
+(gfx936 has no hardware fp8 convert; its code object uses the software e4m3 path.)
 """
 import ctypes
 import logging

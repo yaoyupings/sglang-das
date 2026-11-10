@@ -16,6 +16,7 @@
 // into the q scale (K) and the reduce kernel's v_scale (V).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#include <string.h>
 
 typedef _Float16 h4 __attribute__((ext_vector_type(4)));
 typedef short s4 __attribute__((ext_vector_type(4)));
@@ -270,21 +271,36 @@ __global__ __launch_bounds__(64) void welm_dec_bf16_partial(
 
 typedef char c8 __attribute__((ext_vector_type(8)));
 
+// gfx936 has no fp8 mmac / fp8 convert: the fp8mm / fp8co / prefix kernels are
+// compiled as traps there and the host launchers refuse them (welm_has_fp8).
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx938__)
+#define WELM_NO_FP8 1
+#endif
+
 __device__ __forceinline__ f4 mm8(c8 a, c8 b, f4 c) {
+#ifdef WELM_NO_FP8
+  __builtin_trap();
+  return c;
+#else
 #ifdef NO_MM
   long x = *reinterpret_cast<long*>(&a) ^ *reinterpret_cast<long*>(&b);
   c[0] += (float)(int)x; return c;
 #endif
   return __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(a, b, c, 1, 0);
+#endif
 }
 
 // e4m3 hi + residual lo of two floats packed into one 16-bit pair each
 __device__ __forceinline__ void split2(float a, float b, uint32_t& hi, uint32_t& lo, int word) {
+#ifdef WELM_NO_FP8
+  __builtin_trap();
+#else
   const uint32_t h = __builtin_hcu_cvt_pk_fp8_f32(a, b, 0, false) & 0xffffu;
   const float ha = __builtin_hcu_cvt_f32_fp8((int)h, false, 0, 0), hb = __builtin_hcu_cvt_f32_fp8((int)h, false, 0, 1);
   const uint32_t r = __builtin_hcu_cvt_pk_fp8_f32(a - ha, b - hb, 0, false) & 0xffffu;
   hi |= h << (16 * word);
   lo |= r << (16 * word);
+#endif
 }
 
 // fp8 KV on the fp8 mmac (16x16x32, probed with lit=1):
@@ -633,11 +649,24 @@ extern "C" int welm_dec_reduce_launch(int B, int H, const void* MID_O, const voi
   return (int)hipGetLastError();
 }
 
+// Host: does the current device have the fp8 mmac / convert instructions (gfx938)? Cached per device.
+static bool welm_has_fp8() {
+  static int cache[64] = {0};  // 0 unknown, 1 yes, 2 no
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return false;
+  if (!cache[dev]) {
+    hipDeviceProp_t p;
+    cache[dev] = hipGetDeviceProperties(&p, dev) == hipSuccess && strncmp(p.gcnArchName, "gfx938", 6) == 0 ? 1 : 2;
+  }
+  return cache[dev] == 1;
+}
+
 extern "C" int welm_dec_partial_launch(
     int kv8, int cp, int nbkv, int nsplit, const void* Q, const void* K, const void* V, const void* BT,
     const void* SEQK, void* MID_O, void* MID_LSE, float qscale, long sqb, long sqh, long skb,
     long skh, long skp, long svb, long svh, long svd, long sbt, long smob, long smoh, long smos,
     long smlb, long smlh, int KVH, int G, int window_left, hipStream_t st) {
+  if (kv8 >= 2 && !welm_has_fp8()) return -2;  // fp8 mmac kernels need gfx938
   dim3 grid(nbkv, nsplit), block(kv8 == 3 ? 256 : 64);
 #define L(CPV)                                                                                     \
   if (kv8 == 3) hipLaunchKernelGGL(welm_dec_fp8co_partial<CPV>, grid, block, 0, st, (const uint16_t*)Q,   \
@@ -813,6 +842,7 @@ extern "C" int welm_pfx_partial_launch(
     const void* SEQK, const void* CUQ, void* MID_O, void* MID_LSE, float qscale, long sqt, long sqh,
     long skb, long skh, long skp, long svb, long svh, long svd, long sbt, long smot, long smoh,
     long smos, long smlt, long smlh, int KVH, int G, hipStream_t st) {
+  if (!welm_has_fp8()) return -2;  // fp8 mmac kernel needs gfx938
   hipLaunchKernelGGL(welm_pfx_fp8mm_partial, dim3(bkv, row_tiles, ns), dim3(256), 0, st, (const uint16_t*)Q,
                      (const uint8_t*)K, (const uint8_t*)V, (const int*)BT, (const int*)SEQK,
                      (const int*)CUQ, (float*)MID_O, (float*)MID_LSE, qscale, sqt, sqh, skb, skh, skp,

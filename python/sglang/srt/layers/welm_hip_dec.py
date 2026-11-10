@@ -5,7 +5,8 @@ G<=16, bf16 or fp8 e4m3 KV. fp8 KV uses the cooperative fp8-mmac partial kernel
 (mode 3, q and P split into fp8 hi/lo); partials are merged by a HIP reduce kernel.
 
 libwelm_hip_dec.so is not tracked (git-ignored); build it on the target machine with
-`bash welm_hip_dec_build.sh` (needs /opt/dtk hipcc, gfx938)."""
+`bash welm_hip_dec_build.sh` (needs /opt/dtk hipcc; builds gfx938 + gfx936).
+On gfx936 only bf16 KV works: the fp8 kernels need gfx938 and their launches return -2."""
 import ctypes, os
 import torch, triton
 

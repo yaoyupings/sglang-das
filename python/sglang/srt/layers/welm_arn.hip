@@ -1,4 +1,4 @@
-// WeLM fused 2/4-rank all-reduce + RMSNorm(s) for TP2 decode (gfx938).
+// WeLM fused 2/4-rank all-reduce + RMSNorm(s) for TP2 decode (gfx938; gfx936 uses the software fp8 convert).
 // Inputs: the two ranks' bf16 partial sums in IPC-mapped uncached buffers (the aiter AR input pool),
 // summed in rank order (bitwise identical on both ranks), then per row:
 //   mode 0 (post-attn, mmq_style_norm_after_attn [+ fp8 per-token quant]):
@@ -266,7 +266,8 @@ __global__ void __launch_bounds__(NT, 1) arn_kernel(
             float sx = fmaxf(block_max(amax, sh), 1e-10f) / 448.f;
 #endif
             if (act) {
-#ifdef SWCVT
+#if defined(SWCVT) || (defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx938__))
+                // gfx936 has no hardware fp8 convert: software e4m3 (same RNE + clamp)
                 uint32_t q[2] = {0, 0};
 #pragma unroll
                 for (int j = 0; j < VPT; j++) {
