@@ -771,6 +771,32 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
         )
 
 
+
+def welm_spec_mixed_chunk_supported(server_args: ServerArgs) -> bool:
+    """WELM_SPEC_MIXED_CHUNK=1: keep mixed chunked prefill with linear MTP.
+
+    Only the single-layer EAGLE/NEXTN chain (topk=1, one draft step) is
+    supported: its verify is a 2-token causal extend, so verify rows can ride
+    in the same EXTEND forward as prefill chunks.
+    """
+    if os.environ.get("WELM_SPEC_MIXED_CHUNK", "0") != "1":
+        return False
+    ok = (
+        server_args.speculative_algorithm in ("EAGLE", "NEXTN")
+        and (server_args.speculative_eagle_topk or 1) == 1
+        and server_args.speculative_num_steps == 1
+        and server_args.speculative_num_draft_tokens == 2
+        and not getattr(server_args, "disable_overlap_schedule", False)
+        and not getattr(server_args, "enable_dp_attention", False)
+        and getattr(server_args, "pp_size", 1) == 1
+    )
+    if not ok:
+        logger.warning(
+            "WELM_SPEC_MIXED_CHUNK=1 ignored: needs EAGLE/NEXTN, topk=1, "
+            "num_steps=1, num_draft_tokens=2, overlap schedule, no DP attention, pp=1."
+        )
+    return ok
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import (
         attention_backends_of,
@@ -804,7 +830,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if server_args.enable_mixed_chunk:
+    if server_args.enable_mixed_chunk and not welm_spec_mixed_chunk_supported(
+        server_args
+    ):
         declare_resolution(
             server_args,
             "_handle_eagle_family",

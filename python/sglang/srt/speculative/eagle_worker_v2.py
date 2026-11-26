@@ -1365,6 +1365,63 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
 
+_WELM_MIX_PROF = os.environ.get("WELM_SPEC_MIXED_PROF") == "1"
+
+
+_MIXED_STEPS_CNT = [0, 0]
+
+class _MixProf:
+    """WELM_SPEC_MIXED_PROF=1: per-phase GPU (event) and host (launch) ms.
+
+    Synchronizes at the end of every step, so it measures isolated phase cost,
+    not the overlapped steady state. Printed by TP rank 0 every 200 steps."""
+
+    stats = {}
+    n = 0
+
+    def __init__(self, kind, **meta):
+        self.kind, self.meta, self.marks = kind, meta, []
+        self.mark("start")
+
+    def mark(self, name):
+        if not _WELM_MIX_PROF:
+            return
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        self.marks.append((name, e, time.perf_counter()))
+
+    def done(self):
+        if not _WELM_MIX_PROF:
+            return
+        self.mark("end")
+        torch.cuda.synchronize()
+        st = _MixProf.stats.setdefault(self.kind, {"_n": 0})
+        st["_n"] += 1
+        for k, v in self.meta.items():
+            st["#" + k] = st.get("#" + k, 0) + v
+        for (_, e0, c0), (name, e1, c1) in zip(self.marks, self.marks[1:]):
+            g, c = st.setdefault(name, [0.0, 0.0]), None
+            g[0] += e0.elapsed_time(e1)
+            g[1] += (c1 - c0) * 1e3
+        _MixProf.n += 1
+        if _MixProf.n % 200 == 0 and torch.distributed.get_rank() % 4 == 0:
+            out = []
+            for kind, st in _MixProf.stats.items():
+                n = st["_n"]
+                parts = [f"{kind} n={n}"]
+                parts += [f"{k[1:]}={v / n:.0f}" for k, v in st.items() if k.startswith("#")]
+                tot = [0.0, 0.0]
+                for k, v in st.items():
+                    if isinstance(v, list):
+                        parts.append(f"{k}={v[0] / n:.2f}/{v[1] / n:.2f}")
+                        tot[0] += v[0]; tot[1] += v[1]
+                parts.append(f"TOTAL={tot[0] / n:.2f}/{tot[1] / n:.2f}")
+                out.append(" ".join(parts))
+            logger.info("WELM_MIX_PROF (gpu/host ms) | " + " || ".join(out))
+            _MixProf.stats = {}
+
+
+
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -1469,7 +1526,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        if getattr(batch, "spec_mixed_decode", None) is not None:
+            return self._forward_spec_mixed(batch, on_publish)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            prof = _MixProf("prefill", ntok_p=int(batch.extend_num_tokens or 0), nreq_p=len(batch.reqs))
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
@@ -1485,6 +1545,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
+            prof.mark("target")
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1510,8 +1571,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.model_specific_states,
                     )
                 )
+                prof.mark("dext_p")
+                prof.done()
                 return batch_output
         else:
+            prof = _MixProf("decode", nv=int(batch.seq_lens.shape[0]))
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
@@ -1547,7 +1611,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            prof.mark("draft")
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            prof.mark("verify")
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1566,8 +1632,228 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
-
+            prof.mark("dext_v")
+            prof.done()
             return batch_output
+
+    def _forward_spec_mixed(self, batch: ScheduleBatch, on_publish=None):
+        """WELM_SPEC_MIXED_CHUNK: one target forward for a prefill chunk plus
+        the running batch's verify (topk=1, steps=1, 2 tokens per request).
+
+        Verify rows ride as 2-token EXTEND segments after the prefill
+        segments: attention is the ordinary causal extend over the paged KV,
+        which for a chain draft equals TARGET_VERIFY.  The KV-mirror prune
+        keeps one row per prefill segment and both rows of every verify
+        segment.  Sampling, acceptance and the draft extends then run per
+        sub-batch exactly as on the unfused paths.
+        """
+        import copy
+
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_uniform_func,
+        )
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.managers.schedule_batch import NGramInputIds
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.speculative.eagle_worker_common import eagle_verify_finish
+
+        pb, dec = batch, batch.spec_mixed_decode
+        np_, nv = len(pb.reqs), len(dec.reqs)
+        dev = self.device
+        # GPU-only FutureMap (needs_cpu_seq_lens=False) leaves the running
+        # batch without host lengths; the fused extend needs them for the
+        # prefix lists and attention metadata. One D2H per fused step.
+        if dec.seq_lens_cpu is None:
+            dec.seq_lens_cpu = dec.seq_lens.cpu()
+            dec.seq_lens_sum = int(dec.seq_lens_cpu.sum())
+        if pb.seq_lens_cpu is None:
+            pb.seq_lens_cpu = pb.seq_lens.cpu()
+            pb.seq_lens_sum = int(pb.seq_lens_cpu.sum())
+
+        prof = _MixProf("mixed", ntok_p=int(pb.extend_num_tokens), nreq_p=np_, nv=nv)
+        # 1. Draft (steps=1: the previous draft-extend's top-1 is the draft).
+        # Adaptive may switch steps here, so K is read only after activation.
+        # steps=0: 1-token trivial verify (= plain decode), as on the decode path.
+        self.activate_step_by_batch(nv)
+        K = self.speculative_num_draft_tokens
+        _MIXED_STEPS_CNT[min(self.speculative_num_steps, 1)] += 1
+        if sum(_MIXED_STEPS_CNT) % 20 == 0:
+            logger.info("WELM spec-mixed steps0=%d steps1=%d", *_MIXED_STEPS_CNT)
+        if self.speculative_num_steps == 0:
+            verify_input = self._build_trivial_verify_input(dec)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(dec)
+        assert verify_input.draft_token.numel() == K * nv, (verify_input.draft_token.shape, K, nv)
+        dec.spec_info = verify_input
+        dec.input_ids = verify_input.draft_token
+        dec.out_cache_loc = assign_extend_cache_locs_uniform_func(
+            req_pool_indices=dec.req_pool_indices,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            start_offset=dec.seq_lens,
+            batch_size=nv,
+            draft_token_num=K,
+            device=dev,
+        )
+        verify_input.seq_lens_cpu = dec.seq_lens_cpu
+        verify_input.seq_lens_sum = int(dec.seq_lens_cpu.sum())
+        dec.forward_mode = ForwardMode.TARGET_VERIFY
+        prof.mark("draft")
+
+        # 2. Fused EXTEND batch: prefill segments, then K-token verify segments.
+        fused = copy.copy(pb)
+        fused.spec_mixed_decode = None
+        fused.forward_mode = ForwardMode.EXTEND
+        fused.reqs = list(pb.reqs) + list(dec.reqs)
+        fused.input_ids = torch.cat([pb.input_ids, dec.input_ids.to(pb.input_ids.dtype)])
+        fused.req_pool_indices = torch.cat([pb.req_pool_indices, dec.req_pool_indices])
+        fused.out_cache_loc = torch.cat(
+            [pb.out_cache_loc, dec.out_cache_loc.to(pb.out_cache_loc.dtype)]
+        )
+        fused.seq_lens = torch.cat([pb.seq_lens, (dec.seq_lens + K).to(pb.seq_lens.dtype)])
+        fused.seq_lens_cpu = torch.cat(
+            [pb.seq_lens_cpu, (dec.seq_lens_cpu + K).to(pb.seq_lens_cpu.dtype)]
+        )
+        fused.seq_lens_sum = int(fused.seq_lens_cpu.sum())
+        if pb.orig_seq_lens is not None:
+            fused.orig_seq_lens = torch.cat(
+                [pb.orig_seq_lens, (dec.seq_lens + K).to(pb.orig_seq_lens.dtype)]
+            )
+        fused.extend_lens = list(pb.extend_lens) + [K] * nv
+        fused.prefix_lens = list(pb.prefix_lens) + dec.seq_lens_cpu.tolist()
+        fused.extend_logprob_start_lens = list(pb.extend_logprob_start_lens) + [K] * nv
+        n_tok_p = int(pb.extend_num_tokens)
+        fused.extend_num_tokens = n_tok_p + K * nv
+        if pb.n_gram_input_ids is not None and len(pb.n_gram_input_ids) > 0:
+            # -1: read predecessors from the device ring (write-before-read
+            # for welm_spec_mixed, so the draft row sees its bonus token).
+            fused.n_gram_input_ids = NGramInputIds(
+                input_ids_grams=[
+                    torch.cat([g, g.new_full((K * nv,), -1)])
+                    for g in pb.n_gram_input_ids.input_ids_grams
+                ]
+            )
+        if pb.multimodal_inputs is not None:
+            fused.multimodal_inputs = list(pb.multimodal_inputs) + [None] * nv
+        fused.spec_info = None
+        fused.return_logprob = False
+        fused.is_prefill_only = False
+
+        fb = ForwardBatch.init_new(
+            fused,
+            self.target_worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=self.need_hidden_states_before_norm,
+        )
+        fb.return_logprob = False
+        fb.welm_spec_mixed = True
+        lens_p = fb.extend_seq_lens[:np_]
+        fb.welm_last_index_override = torch.cat(
+            [
+                torch.cumsum(lens_p, dim=0) - 1,
+                n_tok_p + torch.arange(K * nv, device=lens_p.device, dtype=lens_p.dtype),
+            ]
+        )
+        fb.welm_mirror_q_lens = torch.cat(
+            [
+                torch.ones(np_, dtype=torch.int32, device=lens_p.device),
+                torch.full((nv,), K, dtype=torch.int32, device=lens_p.device),
+            ]
+        )
+        fb.welm_mirror_max_q = K
+        fb.welm_spec_nv = nv
+        fb.welm_spec_k = K
+        prof.mark("build")
+
+        # 3. Target forward.
+        out = self.target_worker.forward_batch_generation(
+            batch=None, forward_batch=fb, is_verify=True
+        )
+        lo = out.logits_output
+        prof.mark("target")
+        n_tot = n_tok_p + K * nv
+
+        def _split(o, sl):
+            if isinstance(o, torch.Tensor) and o.dim() > 0 and o.shape[0] == n_tot:
+                return o[sl]
+            if isinstance(o, dict):
+                return {k: _split(v, sl) for k, v in o.items()}
+            if isinstance(o, (tuple, list)):
+                return type(o)(_split(x, sl) for x in o)
+            return o
+
+        mss = lo.model_specific_states
+        lo_p = LogitsProcessorOutput(
+            next_token_logits=lo.next_token_logits[:np_],
+            hidden_states=None if lo.hidden_states is None else lo.hidden_states[:np_],
+            model_specific_states=_split(mss, slice(0, n_tok_p)),
+        )
+        lo_v = LogitsProcessorOutput(
+            next_token_logits=lo.next_token_logits[np_:],
+            hidden_states=None if lo.hidden_states is None else lo.hidden_states[np_:],
+            model_specific_states=_split(mss, slice(n_tok_p, None)),
+        )
+
+        # 4. Prefill sampling (as tp_worker does for a plain prefill).
+        fb_p = copy.copy(fb)
+        fb_p.batch_size = np_
+        fb_p.sampling_info = pb.sampling_info
+        fb_p.seq_lens = pb.seq_lens
+        fb_p.req_pool_indices = pb.req_pool_indices
+        fb_p.top_logprobs_nums = None
+        fb_p.token_ids_logprobs = None
+        next_ids_p = self.target_worker.model_runner.sample(lo_p, fb_p)
+        prof.mark("sample_p")
+
+        # 5. Verify acceptance for the running batch.
+        result_v = eagle_verify_finish(
+            dec,
+            verify_input,
+            lo_v,
+            target_worker=self.target_worker,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            topk=self.topk,
+            num_draft_tokens=K,
+            device=dev,
+            finalize_tree_path=True,
+            keep_alive=fb,
+        )
+        prof.mark("verify_finish")
+        result_p = GenerationBatchResult(
+            logits_output=lo_p,
+            next_token_ids=next_ids_p,
+            can_run_cuda_graph=False,
+            new_seq_lens=pb.seq_lens,
+            routed_experts_output=out.routed_experts_output,
+            expert_distribution_metrics=out.expert_distribution_metrics,
+        )
+        result_p.spec_mixed_decode_result = result_v
+        if on_publish is not None:
+            on_publish(torch.cat([pb.seq_lens, result_v.new_seq_lens.to(pb.seq_lens.dtype)]))
+
+        # 6. Draft extends, one per sub-batch.
+        with (
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            hid_p = lo_p.hidden_states
+            if hid_p is not None:
+                hid_p = hid_p.detach().contiguous().clone()
+            result_p.next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                pb, hid_p, next_ids_p, None, lo_p.model_specific_states
+            )
+            prof.mark("dext_p")
+            self.draft_worker._draft_extend_for_decode(dec, result_v)
+            prof.mark("dext_v")
+        prof.done()
+        return result_p
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

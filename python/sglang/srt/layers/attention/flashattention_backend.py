@@ -196,6 +196,7 @@ def _welm_host_seq_lens(forward_batch, cu_seqlens_q, metadata):
     return lens
 
 
+_WELM_VERIFY_AS_DECODE = __import__("os").environ.get("WELM_VERIFY_AS_DECODE", "0") == "1"
 _WELM_DEDUP_DECODE = __import__("os").environ.get("WELM_DEDUP_DECODE", "true").lower() in ("1", "true")
 _WELM_DEDUP_MIN_BS = int(__import__("os").environ.get("WELM_DEDUP_MIN_BS", "4"))
 _WELM_DEDUP_FIRST_LAYER = None
@@ -214,14 +215,14 @@ def _welm_dedup_note(reason):
 
 def _welm_dedup_decode_state(
     forward_batch, q, key_cache, page_table, cache_seqlens, layer, window_size, excluded,
-    mixed=False,
+    mixed=False, verify=False,
 ):
     """Shared-prefix grouping for full-attention decode rows (once per forward)."""
     tag = "mixed" if mixed else "dec"
     if not _WELM_DEDUP_DECODE or excluded:
         _welm_dedup_note(tag + ":excluded")
         return None
-    if not (forward_batch.forward_mode.is_decode() or mixed):
+    if not (forward_batch.forward_mode.is_decode() or mixed or verify):
         return None
     if window_size is not None and tuple(window_size) != (-1, -1):
         _welm_dedup_note(tag + ":swa")
@@ -451,6 +452,10 @@ def _hcu_mixed_decode_rows(forward_batch) -> int:
     single query to its full context is the same computation either way.
     """
     n = getattr(forward_batch, "_hcu_mixed_decode_rows", None)
+    if n is None and _WELM_VERIFY_AS_DECODE and getattr(forward_batch, "welm_spec_mixed", False):
+        # WELM_SPEC_MIXED_CHUNK: trailing K-token verify segments.
+        n = forward_batch.welm_spec_nv * forward_batch.welm_spec_k
+        forward_batch._hcu_mixed_decode_rows = n
     if n is None:
         n = 0
         lens = forward_batch.extend_seq_lens_cpu
@@ -1363,7 +1368,14 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-            if forward_batch.enable_kv_mirror:
+            if forward_batch.enable_kv_mirror and forward_batch.welm_mirror_q_lens is not None:
+                # WELM_SPEC_MIXED_CHUNK: verify segments keep both query rows.
+                metadata.mirror_cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(forward_batch.welm_mirror_q_lens, dim=0, dtype=torch.int32),
+                    (1, 0),
+                )
+                metadata.mirror_max_seq_len_q = forward_batch.welm_mirror_max_q
+            elif forward_batch.enable_kv_mirror:
                 metadata.mirror_cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -1508,6 +1520,97 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _welm_fused_mirror_attention(
+        self, q, key_cache, value_cache, page_table, cache_seqlens, layer,
+        window_size, sinks, forward_batch, out,
+    ):
+        """WELM_SPEC_MIXED_CHUNK KV-mirror layers: one query per prefill
+        segment (its last token) and K per verify segment, i.e. every row is
+        a decode query.  Paged decode kernel instead of varlen KV copy."""
+        K, nv = forward_batch.welm_spec_k, forward_batch.welm_spec_nv
+        bs = cache_seqlens.shape[0]
+        n_pre = bs - nv
+        H, D = layer.tp_q_head_num, layer.head_dim
+        offs = torch.arange(1 - K, 1, device=cache_seqlens.device, dtype=torch.int32)
+        cs = torch.cat([
+            cache_seqlens[:n_pre].to(torch.int32),
+            (cache_seqlens[n_pre:].to(torch.int32).view(-1, 1) + offs).clamp_(min=1).view(-1),
+        ])
+        pt = torch.cat([page_table[:n_pre], page_table[n_pre:].repeat_interleave(K, dim=0)])
+        rows = n_pre + K * nv
+        result = vllm_flash_attn_with_kvcache(
+            q=q.contiguous().view(rows, H, D).unsqueeze(1),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=pt,
+            cache_seqlens=cs,
+            cu_seqlens_q=torch.arange(rows + 1, device=cs.device, dtype=torch.int32),
+            max_seqlen_q=1,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            num_splits=self.num_splits,
+            ver=self.fa_impl_ver,
+            sinks=sinks,
+        )
+        result = result.reshape(rows, H, layer.v_head_dim)
+        if out is not None:
+            out.copy_(result.view_as(out))
+            return out
+        return result
+
+    def _welm_verify_as_decode(
+        self, q, key_cache, value_cache, page_table, cache_seqlens, K, layer,
+        window_size, sinks, forward_batch, out,
+    ):
+        """WELM_VERIFY_AS_DECODE: chain (topk=1) target verify as K*bs decode rows.
+
+        Draft token j of a request is a decode query over the first
+        ``seq_len + j + 1`` cached tokens (all K draft tokens' KV are already
+        stored), which is exactly the causal verify mask.  Runs the paged
+        decode kernels (HIP decode / shared-prefix dedup) instead of the
+        generic varlen kernel, which copies the paged KV to a contiguous
+        buffer on every layer.
+        """
+        bs = cache_seqlens.shape[0]
+        H, D = layer.tp_q_head_num, layer.head_dim
+        q_dec = q.contiguous().view(bs * K, H, D)
+        pt = page_table.repeat_interleave(K, dim=0)
+        offs = torch.arange(1 - K, 1, device=cache_seqlens.device, dtype=torch.int32)
+        cs = (cache_seqlens.to(torch.int32).view(bs, 1) + offs).clamp_(min=1).view(-1)
+        dedup = _welm_dedup_decode_state(
+            forward_batch, q_dec, key_cache, pt, cs, layer, window_size, False, verify=True,
+        )
+        if dedup is not None:
+            from sglang.srt.layers.attention import welm_dedup_decode
+
+            result = welm_dedup_decode.attend(
+                q_dec, key_cache, value_cache, cs, dedup, sinks=sinks
+            )
+        else:
+            result = vllm_flash_attn_with_kvcache(
+                q=q_dec.unsqueeze(1),
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=pt,
+                cache_seqlens=cs,
+                cu_seqlens_q=torch.arange(bs * K + 1, device=cs.device, dtype=torch.int32),
+                max_seqlen_q=1,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
+                sinks=sinks,
+            )
+        result = result.reshape(bs * K, H, D)
+        if out is not None:
+            out.copy_(result.view_as(out))
+            return out
+        return result
+
     def _hcu_mixed_extend_attention(
         self, q, key_cache, value_cache, page_table, cu_seqlens_q,
         cache_seqlens, max_seqlen_q, metadata, layer, window_size, sinks,
@@ -1523,8 +1626,15 @@ class FlashAttentionBackend(AttentionBackend):
         """
         n_dec = _hcu_mixed_decode_rows(forward_batch)
         bs = cache_seqlens.shape[0]
-        n_pre = bs - n_dec
+        spec_k = forward_batch.welm_spec_k if getattr(forward_batch, "welm_spec_mixed", False) else 1
+        n_pre = bs - n_dec // spec_k
         H, D = layer.tp_q_head_num, layer.head_dim
+        dec_pt, dec_cs = page_table[n_pre:], cache_seqlens[n_pre:]
+        if spec_k > 1:
+            # Verify segment rows -> one decode query per draft token.
+            dec_pt = dec_pt.repeat_interleave(spec_k, dim=0)
+            offs = torch.arange(1 - spec_k, 1, device=dec_cs.device, dtype=torch.int32)
+            dec_cs = (dec_cs.to(torch.int32).view(-1, 1) + offs).clamp_(min=1).view(-1)
         q2 = q.contiguous().view(-1, H, D)
         t_pre = q2.shape[0] - n_dec
         if out is None:
@@ -1597,8 +1707,8 @@ class FlashAttentionBackend(AttentionBackend):
             q_dec = q2[t_pre:]
             q_ratio = layer.scaling / layer.head_dim**-0.5
             dedup = _welm_dedup_decode_state(
-                forward_batch, q_dec, key_cache, page_table[n_pre:],
-                cache_seqlens[n_pre:], layer, window_size, False, mixed=True,
+                forward_batch, q_dec, key_cache, dec_pt,
+                dec_cs, layer, window_size, False, mixed=True,
             )
             if dedup is not None and abs(q_ratio - 1.0) > 1e-7:
                 q_dec = q_dec * q_ratio
@@ -1606,7 +1716,7 @@ class FlashAttentionBackend(AttentionBackend):
             from sglang.srt.layers.attention import welm_dedup_decode
 
             welm_dedup_decode.attend(
-                q_dec, key_cache, value_cache, cache_seqlens[n_pre:], dedup,
+                q_dec, key_cache, value_cache, dec_cs, dedup,
                 sinks=sinks, out=out[t_pre:],
             )
             return out
@@ -1614,8 +1724,8 @@ class FlashAttentionBackend(AttentionBackend):
             q=q2[t_pre:].unsqueeze(1),
             k_cache=key_cache,
             v_cache=value_cache,
-            page_table=page_table[n_pre:],
-            cache_seqlens=cache_seqlens[n_pre:],
+            page_table=dec_pt,
+            cache_seqlens=dec_cs,
             softmax_scale=layer.scaling,
             causal=True,
             window_size=window_size,
@@ -2054,6 +2164,38 @@ class FlashAttentionBackend(AttentionBackend):
                 if _fa_out is not None:
                     _fa_out.copy_(result.view_as(_fa_out))
                     result = _fa_out
+            elif (
+                _WELM_VERIFY_AS_DECODE
+                and self._use_hcu_legacy_layout
+                and getattr(forward_batch, "welm_spec_mixed", False)
+                and getattr(layer, "is_kv_mirror", False)
+                and cu_seqlens_q is metadata.mirror_cu_seqlens_q
+                and not use_cascade_attn
+                and not use_local_attn
+                and layer.k_scale is None
+            ):
+                result = self._welm_fused_mirror_attention(
+                    q, key_cache, value_cache, page_table, cache_seqlens, layer,
+                    window_size, kwargs.get("sinks"), forward_batch, _fa_out,
+                )
+            elif (
+                _WELM_VERIFY_AS_DECODE
+                and self._use_hcu_legacy_layout
+                and forward_batch.forward_mode.is_target_verify()
+                and self.topk == 1
+                and 1 < max_seqlen_q <= 4
+                and causal
+                and cu_seqlens_q is metadata.cu_seqlens_q
+                and not use_cascade_attn
+                and not use_local_attn
+                and not layer.is_cross_attention
+                and layer.k_scale is None
+                and q.numel() == cache_seqlens.shape[0] * max_seqlen_q * layer.tp_q_head_num * layer.head_dim
+            ):
+                result = self._welm_verify_as_decode(
+                    q, key_cache, value_cache, page_table, cache_seqlens, max_seqlen_q,
+                    layer, window_size, kwargs.get("sinks"), forward_batch, _fa_out,
+                )
             elif self._use_hcu_legacy_layout and max_seqlen_q > 1:
                 result = vllm_flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

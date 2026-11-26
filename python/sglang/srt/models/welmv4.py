@@ -574,6 +574,23 @@ def _welm_mirror_ids_for_imitated(attn, imitated_layer_idx: int) -> List[int]:
     ]
 
 
+_WELM_ARN_VERIFY = get_bool_env_var("WELM_ARN_VERIFY", "false")
+
+
+def _welm_arn_mode_ok(mode):
+    """Fused AR+norm (welm_arn) runs inside decode CUDA graphs; target verify
+    is replayed by the same decode graph runner, so it can use it too."""
+    return mode.is_decode() or (_WELM_ARN_VERIFY and mode.is_target_verify())
+
+
+def _welm_last_index(forward_batch):
+    """Rows kept by the KV-mirror prune. Default: last token of each extend
+    segment. WELM_SPEC_MIXED_CHUNK keeps every row of the verify segments."""
+    if forward_batch.welm_last_index_override is not None:
+        return forward_batch.welm_last_index_override
+    return torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+
+
 class WelmSpecNgramRing:
     """Per-request ring of recent token ids for speculative decoding.
 
@@ -690,6 +707,12 @@ def welm_spec_n_gram_input_ids(
             # predecessors come from the ring, like a plain decode step.
             # In place: callers (and prefill-graph capture) keep these
             # tensors as the batch's n-gram buffers.
+            if forward_batch.welm_spec_mixed:
+                # Fused verify segments are 2 tokens: the draft token's
+                # predecessor is the bonus token of this same forward, so
+                # write before reading (as the TARGET_VERIFY branch does).
+                tail = valid & (idx >= lens - slots)
+                ring[torch.where(tail, rows, 0), torch.remainder(tpos, slots)] = ids
             ring_grams = _welm_read_ring(ring, rows, tpos)
             for g, rg in zip(current.input_ids_grams, ring_grams):
                 g.copy_(torch.where(g < 0, rg.to(g.dtype), g))
@@ -1930,9 +1953,7 @@ class Qwen2MoeAttention(nn.Module):
                     and forward_batch.forward_mode.is_extend_without_speculative()
                     and forward_batch.custom_last_index is None
                 ):
-                    forward_batch.custom_last_index = (
-                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                    )
+                    forward_batch.custom_last_index = _welm_last_index(forward_batch)
                     hidden_states = hidden_states[forward_batch.custom_last_index]
                 kv_activation = kv_mirror_states.pop(self.kv_mirror_layer_idx, None)
                 if kv_activation is None:
@@ -2462,7 +2483,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             self.self_attn._arn_defer = (
                 use_mmq_norm_after_attn
                 and not use_dp_layer_communicator
-                and forward_batch.forward_mode.is_decode()
+                and _welm_arn_mode_ok(forward_batch.forward_mode)
                 and not dump_this_layer
                 and residual is not None
                 and welm_arn.ready()
@@ -2985,9 +3006,7 @@ class Qwen2MoeModel(nn.Module):
                 and forward_batch.custom_last_index is None
                 and self.start_layer > min(mirror_layers)
             ):
-                forward_batch.custom_last_index = (
-                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                )
+                forward_batch.custom_last_index = _welm_last_index(forward_batch)
 
         aux_hidden_states = []
         # TBO's operation plan only carries hidden/residual.  Mirror state is
@@ -3022,7 +3041,7 @@ class Qwen2MoeModel(nn.Module):
                             nxt is not None
                             and getattr(nxt, "ppln", False)
                             and nxt.layer_id not in nxt.prenorm_layer_idx
-                            and forward_batch.forward_mode.is_decode()
+                            and _welm_arn_mode_ok(forward_batch.forward_mode)
                             and not is_dp_attention_enabled()
                             and (i + 1) not in self.layers_to_capture
                             and welm_arn.ready()

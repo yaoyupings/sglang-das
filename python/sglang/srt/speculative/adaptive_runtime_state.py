@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -122,8 +123,29 @@ class AdaptiveController:
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
-        if new_step is not None:
-            self._activate(new_step)
+        # WELM debug: WELM_ADAPT_STRESS=K flips between the min/max built
+        # states every K verifies, to reproduce switch-time races fast.
+        k = int(os.environ.get("WELM_ADAPT_STRESS", "0") or 0)
+        if k > 0 and len(self._states) > 1:
+            self._stress_n = getattr(self, "_stress_n", 0) + 1
+            if self._stress_n % k == 0:
+                lo, hi = min(self._states), max(self._states)
+                slot = self.params._route(batch_size)
+                forced = lo if self.worker.speculative_num_steps == hi else hi
+                if forced in slot.candidate_steps:  # keep slot state valid
+                    new_step = forced
+                    slot.current_steps = forced
+        if new_step is None:
+            return
+        # WELM_ADAPT_DEFER=1: this runs in batch-result processing (schedule
+        # stream) while the overlap-scheduled next batch is already queued on
+        # forward_stream; swapping backends / freeing chain buffers here races
+        # with in-flight kernels (VMFault). Only record the decision (params
+        # slot already holds it); the next decode/mixed forward applies it via
+        # activate_step_by_batch inside forward_stream_ctx.
+        if os.environ.get("WELM_ADAPT_DEFER", "0") == "1":
+            return
+        self._activate(new_step)
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

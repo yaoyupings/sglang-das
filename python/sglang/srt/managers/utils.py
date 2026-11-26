@@ -93,6 +93,11 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # WELM_SPEC_MIXED_CHUNK: verify result of the running batch fused into
+    # this prefill forward, and the (decode) batch it belongs to.
+    spec_mixed_decode_result: Optional["GenerationBatchResult"] = None
+    spec_mixed_decode_batch: Optional[Any] = None
+
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).

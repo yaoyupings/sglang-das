@@ -136,12 +136,22 @@ class EagleDraftWorkerBase(ABC):
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0
-        self._topk1_parents_prealloc = torch.arange(
-            -1, parent_width - 1, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
-        self._topk1_score_indices_prealloc = torch.arange(
-            num_steps, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
+        # WELM: keep one immutable pair per (steps, max_bs) alive for the
+        # process lifetime. Adaptive switching re-runs this; freeing the old
+        # pair would leave in-flight kernels / captured graphs reading freed
+        # memory (VMFault). A few KB each.
+        cache = self.__dict__.setdefault("_topk1_chain_cache", {})
+        key = (num_steps, max_bs)
+        if key not in cache:
+            cache[key] = (
+                torch.arange(
+                    -1, parent_width - 1, dtype=torch.long, device=self.device
+                ).repeat(max_bs, 1),
+                torch.arange(
+                    num_steps, dtype=torch.long, device=self.device
+                ).repeat(max_bs, 1),
+            )
+        self._topk1_parents_prealloc, self._topk1_score_indices_prealloc = cache[key]
 
 
 class BaseSpecWorker(ABC):

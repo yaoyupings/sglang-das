@@ -2144,6 +2144,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # WELM_SPEC_MIXED_CHUNK: running (spec decode) batch verified inside this
+    # prefill's forward. Set by the scheduler, consumed by run_batch.
+    spec_mixed_decode: Optional["ScheduleBatch"] = None
 
     # For split prefill
     split_index: int = 0

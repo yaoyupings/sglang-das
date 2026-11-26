@@ -1023,6 +1023,9 @@ class ModelRunner:
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
+        # The prefill graph bakes this backend's metadata buffers in; adaptive
+        # spec later swaps self.attn_backend, so replay must use this one.
+        self._prefill_graph_attn_backend = self.attn_backend
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
@@ -1419,6 +1422,7 @@ class ModelRunner:
             force_for_draft_worker=force_for_draft_worker,
         )
         self.prefill_cuda_graph_runner = capture.runner
+        self._prefill_graph_attn_backend = self.attn_backend
         self.graph_memory_usage = replace_graph_memory_usage(
             self.graph_memory_usage,
             capture.memory_usage,
@@ -1761,6 +1765,7 @@ class ModelRunner:
                 )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and not forward_batch.welm_spec_mixed
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
@@ -1778,10 +1783,21 @@ class ModelRunner:
                 # TODO: the timing here is too broad -- it also includes
                 # load_batch time. Move it into the prefill cuda graph runner
                 # to capture only the model.forward part.
-                with device_timer_ctx(self.device_timer, category):
-                    ret = self.prefill_cuda_graph_runner.execute(
-                        forward_batch, **kwargs
-                    )
+                # Adaptive spec swaps self.attn_backend per step state; the
+                # graph's captured kernels read the capture-time backend's
+                # buffers, so replay must refresh those, not the swapped ones.
+                pinned = getattr(self, "_prefill_graph_attn_backend", None)
+                swapped = pinned is not None and pinned is not self.attn_backend
+                if swapped:
+                    active_backend, self.attn_backend = self.attn_backend, pinned
+                try:
+                    with device_timer_ctx(self.device_timer, category):
+                        ret = self.prefill_cuda_graph_runner.execute(
+                            forward_batch, **kwargs
+                        )
+                finally:
+                    if swapped:
+                        self.attn_backend = active_backend
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.

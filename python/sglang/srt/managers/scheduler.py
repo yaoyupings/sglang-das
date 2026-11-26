@@ -360,6 +360,59 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_WELM_STEP_PROF = os.environ.get("WELM_STEP_PROF") == "1"
+_WELM_STEP_Q = []
+_WELM_STEP_ST = {}
+_WELM_STEP_N = [0, None]
+
+
+def _welm_step_prof_begin(batch, spec_dec, stream):
+    """WELM_STEP_PROF=1: per-forward GPU time by step kind, read back lazily
+    with Event.query() (no host sync, so overlap scheduling is undisturbed)."""
+    if not _WELM_STEP_PROF:
+        return None
+    fm = batch.forward_mode
+    if spec_dec is not None:
+        kind, ntok, nd = "fused", int(batch.extend_num_tokens or 0), len(spec_dec.reqs)
+    elif fm.is_mixed():
+        nd = len(batch.decoding_reqs or [])
+        kind, ntok = "mixed", int(batch.extend_num_tokens or 0) - nd
+    elif fm.is_extend():
+        kind, ntok, nd = "prefill", int(batch.extend_num_tokens or 0), 0
+    elif fm.is_decode():
+        kind, ntok, nd = "decode", 0, len(batch.reqs)
+    else:
+        return None
+    e0 = torch.cuda.Event(enable_timing=True)
+    e0.record(stream)
+    return [kind, ntok, nd, e0, None, time.perf_counter()]
+
+
+def _welm_step_prof_end(sp, stream):
+    if sp is None:
+        return
+    sp[4] = torch.cuda.Event(enable_timing=True)
+    sp[4].record(stream)
+    _WELM_STEP_Q.append(sp)
+    while _WELM_STEP_Q and _WELM_STEP_Q[0][4].query():
+        kind, ntok, nd, e0, e1, t = _WELM_STEP_Q.pop(0)
+        st = _WELM_STEP_ST.setdefault(kind, [0, 0.0, 0, 0, []])
+        ms = e0.elapsed_time(e1)
+        st[0] += 1; st[1] += ms; st[2] += ntok; st[3] += nd; st[4].append(ms)
+        if _WELM_STEP_N[1] is None:
+            _WELM_STEP_N[1] = t
+        _WELM_STEP_N[0] += 1
+        if _WELM_STEP_N[0] % 2000 == 0:
+            wall = (t - _WELM_STEP_N[1]) * 1e3
+            parts = []
+            for k, (n, tot, tk, d, lst) in sorted(_WELM_STEP_ST.items()):
+                lst.sort()
+                parts.append(f"{k} n={n} mean={tot / n:.1f}ms p50={lst[n // 2]:.1f} p90={lst[int(n * .9)]:.1f} "
+                             f"max={lst[-1]:.1f} ptok={tk / n:.0f} dreq={d / n:.1f} gpu_share={tot / wall:.2f}")
+            logger.info("WELM_STEP_PROF wall=%.0fms | %s", wall, " || ".join(parts))
+            _WELM_STEP_ST.clear(); _WELM_STEP_N[1] = None
+
+
 _MIXED_CHUNK_MIN_TOKENS = int(os.environ.get("SGLANG_MIXED_CHUNK_MIN_TOKENS", "0"))
 # Token budget for admitting short waiting requests ahead of an in-progress
 # chunked prefill (0 disables).
@@ -4156,6 +4209,11 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _spec_mixed_tokens_per_req(self) -> int:
+        if self.spec_algorithm.is_none():
+            return 1
+        return int(get_spec().speculative_num_draft_tokens or 1)
+
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
@@ -4283,7 +4341,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (running_bs * self._spec_mixed_tokens_per_req() if self.is_mixed_chunk else 0),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4583,6 +4641,23 @@ class Scheduler(
             ),
         )
 
+        # WELM_SPEC_MIXED_CHUNK: verify the running batch inside this prefill's
+        # forward instead of merging it (see EAGLEWorkerV2._forward_spec_mixed).
+        if self.is_mixed_chunk and not self.spec_algorithm.is_none():
+            new_batch.decoding_reqs = None
+            if (
+                not running_batch.is_empty()
+                and not (new_batch.return_logprob or running_batch.return_logprob)
+                and not (new_batch.has_grammar or running_batch.has_grammar)
+                and new_batch.input_embeds is None
+                and all(m is None for m in (new_batch.multimodal_inputs or []))
+                and (new_batch.extend_num_tokens or 0) >= _MIXED_CHUNK_MIN_TOKENS
+            ):
+                running_batch = self.update_running_batch(running_batch)
+                if not running_batch.is_empty():
+                    new_batch.spec_mixed_decode = running_batch
+            return new_batch, running_batch
+
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -4780,6 +4855,27 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    @contextmanager
+    def _spec_mixed_isolation(self, batch: Optional[ScheduleBatch]):
+        """_forward_isolation for the fused running batch: same snapshot /
+        sampling_info swap / restore, but pinned into the *current*
+        batch_record_buf slot (record_batch_in_overlap would advance the
+        2-slot ring a second time this iteration)."""
+        if batch is None:
+            yield
+            return
+        snapshot = {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+        if batch.sampling_info is not None:
+            batch.sampling_info = batch.sampling_info.copy_for_forward()
+        self.batch_record_buf[self.batch_record_ct].extend(
+            [batch, [getattr(batch, f.name, None) for f in dataclasses.fields(batch)]]
+        )
+        try:
+            yield
+        finally:
+            for name, value in snapshot.items():
+                setattr(batch, name, value)
+
     def _forward_with_waiting_queue_ingress(self, batch, **fwd_kwargs):
         if not self._forward_ingress_enabled:
             return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
@@ -4938,9 +5034,13 @@ class Scheduler(
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
+                spec_dec = getattr(batch, "spec_mixed_decode", None)
+                if spec_dec is not None:
+                    self.future_map.resolve_seq_lens_cpu(spec_dec)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
+                _sp = _welm_step_prof_begin(batch, spec_dec, self.forward_stream)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
@@ -4948,9 +5048,18 @@ class Scheduler(
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
+                    if spec_dec is not None:
+                        resolve_forward_inputs(spec_dec, self.future_map)
 
-                    with self._forward_isolation(batch, overlap=True):
+                    with self._forward_isolation(
+                        batch, overlap=True
+                    ), self._spec_mixed_isolation(spec_dec):
                         future_indices = batch.req_pool_indices
+                        publish_indices = (
+                            future_indices
+                            if spec_dec is None
+                            else torch.cat([future_indices, spec_dec.req_pool_indices])
+                        )
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
@@ -4958,7 +5067,7 @@ class Scheduler(
                         fwd_kwargs = {}
                         if not batch.spec_algorithm.is_none():
                             fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices
+                                self.future_map.publish, publish_indices
                             )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
@@ -5019,9 +5128,29 @@ class Scheduler(
                                     )
                         else:
                             batch_result.future_indices = future_indices
+                        res_v = batch_result.spec_mixed_decode_result
+                        if spec_dec is not None and res_v is not None:
+                            dec_indices = spec_dec.req_pool_indices
+                            self._relay_forward_payload(dec_indices, res_v)
+                            res_v.copy_done = self.device_module.Event()
+                            res_v.copy_to_cpu(
+                                return_logprob=False,
+                                return_hidden_states=spec_dec.return_hidden_states,
+                            )
 
+                _welm_step_prof_end(_sp, self.forward_stream)
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
+                if spec_dec is not None:
+                    batch.spec_mixed_decode = None
+                    res_v = batch_result.spec_mixed_decode_result
+                    spec_dec.input_ids = None
+                    spec_dec.spec_info = res_v.next_draft_input
+                    spec_dec.spec_info.future_dsa_topk_indices_available = (
+                        spec_dec.spec_info.dsa_topk_indices is not None
+                    )
+                    spec_dec.spec_info.future_indices = spec_dec.req_pool_indices
+                    batch_result.spec_mixed_decode_batch = spec_dec.copy()
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
@@ -5246,6 +5375,15 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
+                dec_batch = getattr(result, "spec_mixed_decode_batch", None)
+                if dec_batch is not None:
+                    self.batch_result_processor.process_batch_result_decode(
+                        dec_batch, result.spec_mixed_decode_result
+                    )
+                    self._record_step_counters(dec_batch, result.spec_mixed_decode_result)
+                    self.metrics_reporter.log_batch_result_stats(
+                        dec_batch, result.spec_mixed_decode_result
+                    )
         elif batch.forward_mode.is_prebuilt():
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():

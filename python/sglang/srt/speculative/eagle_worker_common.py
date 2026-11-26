@@ -721,7 +721,49 @@ def run_eagle_verify(
         forward_batch=verify_forward_batch,
         is_verify=True,
     )
-    logits_output = forward_batch_output.logits_output
+    return eagle_verify_finish(
+        batch,
+        verify_input,
+        forward_batch_output.logits_output,
+        target_worker=target_worker,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        topk=topk,
+        num_draft_tokens=num_draft_tokens,
+        device=device,
+        finalize_tree_path=finalize_tree_path,
+        grammar_tree=grammar_tree,
+        grammar_barrier=grammar_barrier,
+        can_run_cuda_graph=can_run_cuda_graph,
+        routed_experts_output=forward_batch_output.routed_experts_output,
+        indexer_topk_output=forward_batch_output.indexer_topk_output,
+        keep_alive=verify_forward_batch,
+    )
+
+
+def eagle_verify_finish(
+    batch: ScheduleBatch,
+    verify_input: EagleVerifyInput,
+    logits_output,
+    *,
+    target_worker: TpModelWorker,
+    token_to_kv_pool_allocator: Any,
+    topk: int,
+    num_draft_tokens: int,
+    device: str,
+    finalize_tree_path: bool,
+    grammar_tree=None,
+    grammar_barrier=None,
+    can_run_cuda_graph: bool = False,
+    routed_experts_output=None,
+    indexer_topk_output=None,
+    keep_alive=None,
+) -> GenerationBatchResult:
+    """Post-forward half of run_eagle_verify: sample, accept, bonus tokens.
+
+    Split out so WELM_SPEC_MIXED_CHUNK can run the verify rows inside a fused
+    prefill forward and finish them here unchanged.
+    """
+    bs = len(batch.seq_lens)
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None
@@ -826,7 +868,7 @@ def run_eagle_verify(
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
         new_seq_lens=new_seq_lens,
-        routed_experts_output=forward_batch_output.routed_experts_output,
-        indexer_topk_output=forward_batch_output.indexer_topk_output,
-        extra_keep_alive_refs=[verify_forward_batch],
+        routed_experts_output=routed_experts_output,
+        indexer_topk_output=indexer_topk_output,
+        extra_keep_alive_refs=[keep_alive] if keep_alive is not None else [],
     )

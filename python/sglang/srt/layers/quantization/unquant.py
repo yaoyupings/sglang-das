@@ -859,6 +859,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
+        from sglang.srt.layers.moe import welm_moe_aiter as _wma
+        if _is_hcu and _wma.PREP and layer.w13_weight.dtype == torch.bfloat16:
+            _wma.prepare(layer, self.w13_swiglu_interleaved)
 
         return
 
@@ -1065,6 +1068,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         moe_runner_config = self.moe_runner_config
 
         backend = self.runner.runner_backend
+        from sglang.srt.layers.moe import welm_moe_aiter as _wma
+        if backend.is_triton() and _wma.use(layer, x):
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput as _SCI
+            _tw, _ti, _ = topk_output
+            return _SCI(hidden_states=_wma.run(layer, x, _tw, _ti, moe_runner_config.routed_scaling_factor))
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,

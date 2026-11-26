@@ -558,6 +558,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     enable_kv_mirror: bool = False
     custom_last_index: Optional[torch.Tensor] = None
     scale_seq_factor: int = 1
+    # WELM_SPEC_MIXED_CHUNK: fused prefill + 2-token verify segments in one EXTEND.
+    welm_last_index_override: Optional[torch.Tensor] = None
+    welm_mirror_q_lens: Optional[torch.Tensor] = None
+    welm_mirror_max_q: int = 1
+    welm_spec_mixed: bool = False
+    welm_spec_nv: int = 0
+    welm_spec_k: int = 0
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)

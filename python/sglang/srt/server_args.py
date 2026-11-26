@@ -10353,9 +10353,13 @@ class ServerArgs:
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
-            assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+            from sglang.srt.arg_groups.speculative_hook import (
+                welm_spec_mixed_chunk_supported,
+            )
+
+            assert not self.enable_mixed_chunk or welm_spec_mixed_chunk_supported(
+                self
+            ), "enable_mixed_chunk is not supported with speculative decoding"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
